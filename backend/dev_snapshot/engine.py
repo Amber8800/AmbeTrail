@@ -7,11 +7,11 @@ import threading
 from pathlib import Path
 
 from .common import (SafetyError, atomic_write, new_id, read_json,
-                     relative_path, safe_path, settings_from, utc_now)
-from .commits import CommitService
+                     relative_path, safe_path, settings_from, utc_now, validate_title)
+from .boundary import BoundaryCommitService
 from .git import Git
 from .restore import RestoreService, unfinished
-from .snapshots import Policy, SnapshotService, changes_between, suggest_commit
+from .snapshots import Policy, SnapshotService, changes_between, snapshot_summary, suggest_commit, summarize
 from .store import Store
 
 
@@ -36,7 +36,7 @@ class Session:
         self.core = SnapshotService(git, store, config)
         self.dirty: set[str] = set()
         self.restore = RestoreService(self.core, lambda: self.dirty)
-        self.commits = CommitService(self.core, lambda: self.dirty)
+        self.commits = BoundaryCommitService(self.core, lambda: self.dirty)
         try:
             saved_pause = read_json(store.directory / "preferences.json").get("paused", False)
         except FileNotFoundError:
@@ -55,6 +55,8 @@ class Session:
         self.retry_after = 0.0
         self.pending_settings: dict | None = None
         self.history_reviews: dict[str, dict] = {}
+        self.work_summaries: dict[tuple[str, bool], str] = {}
+        self.interval_summaries: dict[tuple[str, str | None], tuple[str, int]] = {}
         self.worker: threading.Thread | None = None
         self.job: dict | None = None
         self.notify = lambda: None
@@ -121,9 +123,10 @@ class Session:
             self.core.config = self.pending_settings
             self.pending_settings = None
             self.core.cache.clear()
+            self.interval_summaries.clear()
             self.force_full = True
             self.event()
-        if self.paused or not self.store.writable or self.restore.plans or self.history_reviews or busy or time.monotonic() < self.retry_after:
+        if self.paused or not self.store.writable or self.restore.plans or self.history_reviews or busy or any(unfinished(j) for j in self.store.journals()) or time.monotonic() < self.retry_after:
             return False
         now, config = time.monotonic(), self.core.config
         full = self.force_full or now - self.full_hashed >= config["fullHashSeconds"]
@@ -139,10 +142,12 @@ class Session:
         try:
             paths = set(self.pending_paths) if self.pending_paths and due and not full and not reconcile else None
             self.pending_paths.clear()
-            result = self.start_capture("automatic", full=full, changed_paths=paths)
             self.force_full = False
+            result = self.start_capture("automatic", full=full, changed_paths=paths)
             return result is not None
         except (SafetyError, OSError):
+            self.force_full = True
+            self.retry_after = time.monotonic() + config["maxIntervalSeconds"]
             self.message = "기록 지연 · 상태 검토 필요"
             return True
 
@@ -160,12 +165,45 @@ class Session:
     def timeline(self, limit: int = 50) -> list[dict]:
         snapshots = [s for s in self.store.snapshots() if s["reason"] != "backup"]
         indexed = {s["id"]: s for s in snapshots}
+        self.work_summaries = {k: v for k, v in self.work_summaries.items() if k[0] in indexed}
+        self.interval_summaries = {k: v for k, v in self.interval_summaries.items() if k[0] in indexed}
+        context, anchor, baseline, range_error = None, None, None, None
+        if self.store.writable and not (self.worker and self.worker.is_alive()) and not any(unfinished(j) for j in self.store.journals()):
+            try:
+                context = self.git.context()
+                if not context["busy"] and not context["sparse"] and context["branch"]:
+                    anchor = self.commits.anchor(context)
+                    baseline = self.commits.baseline(context, anchor)
+            except (SafetyError, OSError) as error:
+                range_error = str(error) if isinstance(error, SafetyError) else "Git baseline could not be read. Stored history remains available."
+                context, anchor, baseline = None, None, None
         result = []
         for s in snapshots[:max(1, min(limit, 1000))]:
             previous = indexed.get(s["previousSnapshotId"], {})
+            comparison_pruned = bool(s["previousSnapshotId"] and not previous)
+            summary = s.get("summary", "저장된 파일 상태")
+            changed_files = s.get("changedFiles", 0)
+            commit_summary, commit_changed_files = None, None
+            boundary_state = "unavailable"
+            if s.get("summaryVersion") != 3 and not comparison_pruned:
+                key = (s["id"], comparison_pruned)
+                if key not in self.work_summaries:
+                    self.work_summaries[key] = snapshot_summary(self.snapshot_changes(s["id"]))
+                summary = self.work_summaries[key]
+            if baseline is not None and s["context"]["branch"] == context["branch"]:
+                if anchor and s["endedAt"] <= anchor["boundaryAt"]:
+                    boundary_state = "committed"
+                elif s["context"]["head"] in ([context["head"]] + (anchor["sourceHeads"] if anchor else [])):
+                    boundary_state = "ready"
+                    key = (s["id"], context["head"])
+                    if key not in self.interval_summaries:
+                        changes = changes_between(baseline, self.store.snapshot(s["id"])["entries"])
+                        self.interval_summaries[key] = (summarize(changes), len(changes))
+                    commit_summary, commit_changed_files = self.interval_summaries[key]
             result.append({"id": s["id"], "reason": s["reason"], "endedAt": s["endedAt"],
-                           "summary": s.get("summary", "저장된 파일 상태"), "changedFiles": s.get("changedFiles", 0),
-                           "comparisonPruned": bool(s["previousSnapshotId"] and not previous),
+                           "summary": summary, "changedFiles": changed_files, "boundaryState": boundary_state, "rangeError": range_error,
+                           "commitSummary": commit_summary, "commitChangedFiles": commit_changed_files,
+                           "comparisonPruned": comparison_pruned,
                            "metadata": self.store.metadata(s["id"]), "context": s["context"]})
         return result
 
@@ -198,6 +236,9 @@ class Session:
             if not change:
                 raise SafetyError("File is outside the restore plan.")
             before, after = self.entry_content(change["before"]), self.entry_content(change["after"])
+        elif kind == "boundaryStaged":
+            journal = Engine._journal(self, params["operationId"])
+            before, after = self.commits.diff(journal, name)
         elif kind in ("current", "staged"):
             if Policy(self.core).exclusion(name):
                 raise SafetyError("Excluded files cannot be previewed.")
@@ -250,7 +291,7 @@ class Engine:
 
     def call(self, method: str, params: dict) -> object:
         if method == "hello":
-            return {"protocol": 1, "version": "0.1.1", "python": os.sys.version.split()[0]}
+            return {"protocol": 1, "version": "0.1.3", "python": os.sys.version.split()[0]}
         if method == "open":
             config = settings_from(params.get("settings"))
             git = Git(Path(params["root"]).resolve(strict=True), params.get("gitPath", "git"))
@@ -312,6 +353,7 @@ class Engine:
                 return None
             session.core.config = config
             session.core.cache.clear()
+            session.interval_summaries.clear()
             session.force_full = True
             session.event()
             return None
@@ -362,9 +404,11 @@ class Engine:
             session.start_capture("restored", full=False, changed_paths={c["path"] for c in result["changes"]})
         elif method == "commitChoices":
             return session.commits.choices()
+        elif method == "commitBoundaryReview":
+            return session.commits.review(params["snapshotId"])
         elif method == "commitPrepare":
             self._approved(params)
-            result = session.commits.prepare(params["selected"])
+            result = session.commits.prepare_boundary(params["snapshotId"]) if params.get("snapshotId") else session.commits.prepare(params["selected"])
         elif method == "commitExecute":
             self._approved(params)
             result = session.commits.execute(self._journal(session, params["operationId"]), params["message"], params.get("snapshotIds", []))
@@ -391,7 +435,11 @@ class Engine:
         elif method == "commitCancel":
             result = session.commits.cancel(self._journal(session, params["operationId"]))
         elif method == "suggestCommit":
-            return suggest_commit(params["paths"])
+            title = store.metadata(params["snapshotId"]).get("title", "") if params.get("snapshotId") else ""
+            return suggest_commit(params["paths"], title)
+        elif method == "renameSnapshot":
+            store.snapshot(params["snapshotId"])
+            result = store.update_metadata(params["snapshotId"], title=validate_title(params["title"]))
         elif method == "pushReview":
             review = session.commits.push_review()
             token = new_id()

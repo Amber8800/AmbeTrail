@@ -2,7 +2,7 @@
   "name": "dev-snapshot",
   "displayName": "Amberog",
   "description": "Private local development snapshots with reviewed restore and Git commits.",
-  "version": "0.1.1",
+  "version": "0.1.3",
   "publisher": "dev-snapshot",
   "license": "MIT",
   "engines": { "vscode": "^1.95.0" },
@@ -16,16 +16,17 @@
   },
   "contributes": {
     "viewsContainers": { "activitybar": [{ "id": "devSnapshot", "title": "Amberog", "icon": "media/snapshot.svg" }] },
-    "views": { "devSnapshot": [{ "id": "devSnapshot.timeline", "name": "Development history" }] },
+    "views": { "devSnapshot": [{ "id": "devSnapshot.timeline", "name": "작업 기록" }] },
     "commands": [
       { "command": "devSnapshot.captureNow", "title": "Amberog: Capture Now", "icon": "$(add)" },
       { "command": "devSnapshot.refresh", "title": "Amberog: Refresh", "icon": "$(refresh)" },
       { "command": "devSnapshot.pauseRecording", "title": "Amberog: Pause Recording" },
       { "command": "devSnapshot.resumeRecording", "title": "Amberog: Resume Recording" },
       { "command": "devSnapshot.openDiff", "title": "Amberog: Compare with Previous Snapshot", "icon": "$(diff)" },
-      { "command": "devSnapshot.restoreSnapshot", "title": "Amberog: Restore Snapshot", "icon": "$(history)" },
+      { "command": "devSnapshot.restoreSnapshot", "title": "Amberog: 스냅샷 복원", "icon": "$(history)" },
       { "command": "devSnapshot.undoRestore", "title": "Amberog: Undo Last Restore" },
-      { "command": "devSnapshot.prepareCommit", "title": "Amberog: Review Current Files for Commit" },
+      { "command": "devSnapshot.prepareCommit", "title": "Amberog: 이 시점까지의 작업 커밋", "icon": "$(git-commit)" },
+      { "command": "devSnapshot.renameSnapshot", "title": "Amberog: 작업 이름 편집", "icon": "$(edit)" },
       { "command": "devSnapshot.push", "title": "Amberog: Review and Push" },
       { "command": "devSnapshot.pinSnapshot", "title": "Amberog: Toggle Snapshot Pin", "icon": "$(pin)" },
       { "command": "devSnapshot.manageHistory", "title": "Amberog: Manage History" },
@@ -37,9 +38,10 @@
         { "command": "devSnapshot.refresh", "when": "view == devSnapshot.timeline", "group": "navigation" }
       ],
       "view/item/context": [
-        { "command": "devSnapshot.restoreSnapshot", "when": "view == devSnapshot.timeline && viewItem == snapshot", "group": "inline" },
-        { "command": "devSnapshot.pinSnapshot", "when": "view == devSnapshot.timeline && viewItem == snapshot", "group": "inline" },
-        { "command": "devSnapshot.prepareCommit", "when": "view == devSnapshot.timeline && viewItem == snapshot", "group": "review" }
+        { "command": "devSnapshot.prepareCommit", "when": "view == devSnapshot.timeline && viewItem == snapshot", "group": "inline@1" },
+        { "command": "devSnapshot.restoreSnapshot", "when": "view == devSnapshot.timeline && viewItem == snapshot", "group": "inline@2" },
+        { "command": "devSnapshot.renameSnapshot", "when": "view == devSnapshot.timeline && viewItem == snapshot", "group": "edit@1" },
+        { "command": "devSnapshot.pinSnapshot", "when": "view == devSnapshot.timeline && viewItem == snapshot", "group": "edit@2" }
       ]
     },
     "configuration": {
@@ -68,7 +70,7 @@
     "test:bridge": "npm run compile:test && node --test out/test/bridge.test.js",
     "test:integration": "npm run build && npm run compile:test && node out/test/runIntegration.js",
     "benchmark": "node scripts/python.mjs backend/benchmark.py",
-    "package": "npm run build && vsce package --out amberog-0.1.1.vsix",
+    "package": "npm run build && vsce package --out amberog-0.1.3.vsix",
     "vscode:prepublish": "npm run check && npm run build"
   },
   "dependencies": {},

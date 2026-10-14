@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import fnmatch
 import os
+import re
 import stat
 import threading
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -188,7 +190,8 @@ class SnapshotService:
                             "startedAt": started, "endedAt": utc_now(), "reason": "initial" if new_epoch else reason,
                             "context": context, "policyHash": digest(self.config), "treeHash": tree_hash, "entries": entries}
                 changes = changes_between(previous["entries"] if previous else {}, entries)
-                snapshot["summary"] = summarize(changes)
+                snapshot["summary"] = snapshot_summary(changes)
+                snapshot["summaryVersion"] = 3
                 snapshot["changedFiles"] = len(changes)
                 self.store.save_snapshot(snapshot)
                 return snapshot
@@ -225,15 +228,65 @@ def changes_between(before: dict, after: dict) -> list[dict]:
     return changes
 
 
+def snapshot_summary(changes: list[dict]) -> str:
+    """Label one capture using its actual changed paths, independent of Git commit boundaries."""
+    if not changes:
+        return "파일 변경 없음"
+    names = [c["path"].rsplit("/", 1)[-1] for c in changes]
+    repeated = {name for name, count in Counter(names).items() if count > 1}
+    labels = []
+    for change, name in zip(changes, names, strict=True):
+        if name in repeated and "/" in change["path"]:
+            name = "/".join(change["path"].split("/")[-2:])
+        name = " ".join(name.split())
+        labels.append(name if len(name) <= 28 else name[:27] + "…")
+    kinds = {c["kind"] for c in changes}
+    action = {"added": "추가", "modified": "수정", "deleted": "삭제"}.get(next(iter(kinds)), "변경") if len(kinds) == 1 else "변경"
+    return "·".join(labels[:2]) + (f" 외 {len(labels) - 2}개" if len(labels) > 2 else "") + " " + action
+
+
 def summarize(changes: list[dict]) -> str:
     if not changes:
-        return "작업 시작 상태 · 파일 내용 변경 없음"
-    roots = sorted({c["path"].split("/")[0] if "/" in c["path"] else "루트" for c in changes})
-    counts = [(label, sum(c["kind"] == kind for c in changes)) for kind, label in (("added", "추가"), ("modified", "수정"), ("deleted", "삭제"))]
-    return "·".join(roots[:2]) + (" 외" if len(roots) > 2 else "") + " · " + ", ".join(f"{label} {n}" for label, n in counts if n)
+        return "작업 시작 상태"
+    areas: dict[str, int] = {}
+    for change in changes:
+        area = work_area(change["path"])
+        areas[area] = areas.get(area, 0) + 1
+    ordered = sorted(areas, key=lambda area: (-areas[area], area))
+    kinds = {c["kind"] for c in changes}
+    action = {"added": "추가", "modified": "수정", "deleted": "삭제"}.get(next(iter(kinds)), "변경") if len(kinds) == 1 else "변경"
+    return "·".join(ordered[:2]) + (" 외" if len(ordered) > 2 else "") + " " + action
 
 
-def suggest_commit(paths: list[str]) -> str:
+def work_area(name: str) -> str:
+    """Describe named files/areas only; do not infer feature completion from contents."""
+    lower = name.lower()
+    tokens = set(re.split(r"[/_.-]+", lower))
+    if tokens & {"test", "tests", "testing", "spec"}:
+        return "테스트"
+    if lower.endswith((".md", ".rst")) or "docs" in tokens:
+        return "문서"
+    if lower.startswith(".github/"):
+        return "CI"
+    for keywords, label in (
+        ({"restore", "recovery"}, "복원"),
+        ({"commit", "commits"}, "커밋"),
+        ({"extension", "timeline", "documents", "ui", "components"}, "UI"),
+        ({"bridge", "rpc", "protocol"}, "코어 통신"),
+        ({"auth", "login", "authentication"}, "인증"),
+        ({"api", "router", "routes"}, "API"),
+        ({"git"}, "Git"),
+        ({"css", "scss", "styles"}, "스타일"),
+        ({"config", "settings", "package", "tsconfig", "pyproject", "esbuild"}, "설정"),
+        ({"snapshot", "snapshots", "store"}, "스냅샷 저장"),
+    ):
+        if tokens & keywords:
+            return label
+    return name.rsplit("/", 1)[-1]
+
+
+def suggest_commit(paths: list[str], title: str = "") -> str:
     docs = all(p.endswith((".md", ".rst", ".txt")) or p.startswith("docs/") for p in paths)
-    tests = all("test" in p.split("/") or "tests" in p.split("/") or ".test." in p or ".spec." in p for p in paths)
-    return f"{'docs' if docs else 'test' if tests else 'chore'}: update project files"
+    tests = all(work_area(p) == "테스트" for p in paths)
+    description = title or summarize([{"path": p, "kind": "modified"} for p in paths])
+    return f"{'docs' if docs else 'test' if tests else 'chore'}: {description}"
