@@ -154,9 +154,10 @@ class Session:
     def summary(self) -> dict:
         snapshots = self.store.snapshots()
         latest = next((s for s in snapshots if s["reason"] != "backup"), None)
+        latest_visible = next((s for s in snapshots if s["reason"] != "backup" and not self.store.is_internal_baseline(s)), None)
         return {"id": self.store.identity["id"], "root": str(self.git.root), "writable": self.store.writable,
                 "paused": self.paused, "status": self.message, "dirtyCount": len(self.dirty),
-                "latestAt": latest["endedAt"] if latest else None,
+                "latestAt": latest_visible["endedAt"] if latest_visible else None,
                 "branch": latest["context"]["branch"] if latest else None,
                 "excludedCount": latest.get("excludedCount", 0) if latest else 0,
                 "job": dict(self.job) if self.job else None,
@@ -178,11 +179,15 @@ class Session:
                 range_error = str(error) if isinstance(error, SafetyError) else "Git baseline could not be read. Stored history remains available."
                 context, anchor, baseline = None, None, None
         result = []
-        for s in snapshots[:max(1, min(limit, 1000))]:
+        visible = [s for s in snapshots if not self.store.is_internal_baseline(s)]
+        for s in visible[:max(1, min(limit, 1000))]:
             previous = indexed.get(s["previousSnapshotId"], {})
             comparison_pruned = bool(s["previousSnapshotId"] and not previous)
             summary = s.get("summary", "저장된 파일 상태")
             changed_files = s.get("changedFiles", 0)
+            initial_paths = self.store.initial_changed_paths(s)
+            if initial_paths is not None:
+                changed_files = len(initial_paths)
             commit_summary, commit_changed_files = None, None
             boundary_state = "unavailable"
             if s.get("summaryVersion") != 3 and not comparison_pruned:
@@ -215,7 +220,12 @@ class Session:
                 before = self.store.snapshot(snapshot["previousSnapshotId"])["entries"]
             except FileNotFoundError:
                 pass
-        return changes_between(before, snapshot["entries"])
+        changes = changes_between(before, snapshot["entries"])
+        initial_paths = self.store.initial_changed_paths(snapshot)
+        if initial_paths is not None:
+            initial_set = set(initial_paths)
+            changes = [c for c in changes if c["path"] in initial_set]
+        return changes
 
     def entry_content(self, entry: dict) -> bytes | None:
         return self.store.get(entry["hash"], entry["size"]) if entry["state"] == "present" else None
@@ -291,7 +301,7 @@ class Engine:
 
     def call(self, method: str, params: dict) -> object:
         if method == "hello":
-            return {"protocol": 1, "version": "0.1.3", "python": os.sys.version.split()[0]}
+            return {"protocol": 1, "version": "0.1.4", "python": os.sys.version.split()[0]}
         if method == "open":
             config = settings_from(params.get("settings"))
             git = Git(Path(params["root"]).resolve(strict=True), params.get("gitPath", "git"))
@@ -457,7 +467,7 @@ class Engine:
         elif method == "usage":
             protected = store.protected_ids()
             return {"bytes": store.usage(), "limit": session.core.config["maxStorageMiB"] * 1024 * 1024,
-                    "snapshots": [{"id": s["id"], "endedAt": s["endedAt"], "reason": s["reason"], "protected": s["id"] in protected} for s in store.snapshots()]}
+                    "snapshots": [{"id": s["id"], "endedAt": s["endedAt"], "reason": s["reason"], "internalBaseline": store.is_internal_baseline(s), "protected": s["id"] in protected} for s in store.snapshots()]}
         elif method == "prune":
             result = store.prune(session.core.config)
         elif method == "deleteSnapshot":

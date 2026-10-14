@@ -79,6 +79,8 @@ test('ordered snapshot boundaries through stdio preserve latest files across res
       await new Promise(resolve => setTimeout(resolve, 50));
       state = await bridge.call('list');
     }
+    assert.deepEqual(await bridge.call('timeline', params), [], 'Clean startup remains an internal baseline');
+    assert.equal((await bridge.call<{ latestAt: string | null }[]>('list'))[0]!.latestAt, null);
     const snapshots: string[] = [];
     for (let number = 1; number <= 5; number++) {
       await fs.writeFile(path.join(repo, 'a.txt'), 'work ' + number);

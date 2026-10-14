@@ -178,8 +178,11 @@ class SnapshotService:
                 if not new_epoch and previous["treeHash"] == tree_hash:
                     return None
                 record_id, epoch_id = new_id(), new_id() if new_epoch else previous["epochId"]
+                initial_changes = None
                 if new_epoch:
-                    changes = [s["path"] for s in self.git.statuses()]
+                    statuses = self.git.statuses()
+                    changes = sorted({name for s in statuses for name in (s["path"], s.get("original", s["path"]))})
+                    initial_changes = [name for name in changes if name in entries and entries[name]["state"] != "excluded"]
                     if not same_context(context, self.git.context()) or generation != self.generation:
                         continue
                     self.store.write_record("epochs", epoch_id, {
@@ -190,9 +193,13 @@ class SnapshotService:
                             "startedAt": started, "endedAt": utc_now(), "reason": "initial" if new_epoch else reason,
                             "context": context, "policyHash": digest(self.config), "treeHash": tree_hash, "entries": entries}
                 changes = changes_between(previous["entries"] if previous else {}, entries)
+                if initial_changes is not None:
+                    snapshot["initialChanges"] = initial_changes
+                    initial_set = set(initial_changes)
+                    changes = [c for c in changes if c["path"] in initial_set]
                 snapshot["summary"] = snapshot_summary(changes)
                 snapshot["summaryVersion"] = 3
-                snapshot["changedFiles"] = len(changes)
+                snapshot["changedFiles"] = len(initial_changes) if initial_changes is not None else len(changes)
                 self.store.save_snapshot(snapshot)
                 return snapshot
             except (FileNotFoundError, SafetyError):

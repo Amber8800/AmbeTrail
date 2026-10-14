@@ -73,6 +73,102 @@ class CoreTests(unittest.TestCase):
         self.assertIsNone(self.core.capture())
         self.assertEqual(len(self.store.snapshots()), 1)
 
+    def test_clean_start_is_internal_and_first_change_compares_with_it(self):
+        session = Session(self.git, self.store, self.config)
+        before = self.git.context(), self.git.index_bytes()
+        self.assertEqual(self.initial["initialChanges"], [])
+        self.assertEqual(session.timeline(), [])
+        self.assertIsNone(session.summary()["latestAt"])
+        size = self.store.usage()
+        restarted = SnapshotService(self.git, self.store, self.config)
+        self.assertIsNone(restarted.capture("initial"))
+        self.assertEqual(self.store.usage(), size)
+        self.write("a.txt", b"first work")
+        first = restarted.capture()
+        self.assertEqual(first["previousSnapshotId"], self.initial["id"])
+        self.assertEqual([s["id"] for s in session.timeline()], [first["id"]])
+        changes = session.snapshot_changes(first["id"])
+        self.assertEqual([(c["path"], c["kind"]) for c in changes], [("a.txt", "modified")])
+        self.assertEqual(session.diff({"snapshotId": first["id"], "path": "a.txt"})["left"], "baseline\r\n")
+        self.write("a.txt", b"later work")
+        self.core.capture()
+        restore = RestoreService(self.core)
+        restore.apply(restore.prepare(first["id"])["id"])
+        self.assertEqual((self.root / "a.txt").read_bytes(), b"first work")
+        self.assertEqual((self.git.context(), self.git.index_bytes()), before)
+
+    def test_startup_with_existing_work_records_only_managed_changed_paths(self):
+        self.write("a.txt", b"existing modification")
+        self.write("b.txt", b"already staged")
+        self.git.add(["b.txt"])
+        self.write("new.txt", b"untracked work")
+        self.write(".env", b"excluded secret")
+        store = Store(self.base / "dirty-start", self.identity)
+        self.addCleanup(store.close)
+        before = self.git.context(), self.git.index_bytes()
+        core = SnapshotService(self.git, store, self.config)
+        startup = core.capture("initial")
+        session = Session(self.git, store, self.config)
+        self.assertEqual(startup["initialChanges"], ["a.txt", "b.txt", "new.txt"])
+        self.assertEqual(session.timeline()[0]["changedFiles"], 3)
+        self.assertEqual({c["path"] for c in session.snapshot_changes(startup["id"])}, {"a.txt", "b.txt", "new.txt"})
+        self.assertEqual(store.get(startup["entries"]["new.txt"]["hash"]), b"untracked work")
+        self.assertEqual((self.git.context(), self.git.index_bytes()), before)
+
+    def test_excluded_only_startup_changes_do_not_create_a_visible_record(self):
+        self.write(".env", b"excluded secret")
+        store = Store(self.base / "excluded-start", self.identity)
+        self.addCleanup(store.close)
+        startup = SnapshotService(self.git, store, self.config).capture("initial")
+        self.assertEqual(startup["initialChanges"], [])
+        self.assertEqual(Session(self.git, store, self.config).timeline(), [])
+        self.assertEqual(startup["entries"][".env"]["state"], "excluded")
+
+    def test_legacy_clean_baseline_is_hidden_without_rewriting_or_losing_pins(self):
+        legacy = dict(self.initial)
+        legacy.pop("initialChanges")
+        legacy["changedFiles"] = 2
+        path = self.store.record("snapshots", legacy["id"])
+        write_json(path, legacy)
+        original = path.read_bytes()
+        session = Session(self.git, self.store, self.config)
+        self.assertEqual(session.timeline(), [])
+        reader = Store(self.store.directory, self.identity, readonly=True)
+        self.addCleanup(reader.close)
+        self.assertEqual(Session(self.git, reader, self.config).timeline(), [])
+        self.store.update_metadata(legacy["id"], pinned=True)
+        self.assertEqual(session.timeline()[0]["id"], legacy["id"])
+        self.store.update_metadata(legacy["id"], pinned=False, title="보존한 기준")
+        self.assertEqual(session.timeline()[0]["metadata"]["title"], "보존한 기준")
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_legacy_existing_work_remains_visible_using_recorded_startup_status(self):
+        self.write("a.txt", b"existing work")
+        store = Store(self.base / "legacy-dirty-start", self.identity)
+        self.addCleanup(store.close)
+        startup = SnapshotService(self.git, store, self.config).capture()
+        startup.pop("initialChanges")
+        startup["changedFiles"] = 2
+        write_json(store.record("snapshots", startup["id"]), startup)
+        self.git.run("checkout", "--", "a.txt")  # Classification uses startup evidence, not today's clean tree.
+        timeline = Session(self.git, store, self.config).timeline()
+        self.assertEqual(timeline[0]["id"], startup["id"])
+        self.assertEqual(timeline[0]["changedFiles"], 1)
+
+    def test_clean_epoch_baselines_do_not_consume_normal_snapshot_count(self):
+        for number in range(2):
+            self.git.run("commit", "--allow-empty", "-m", f"external {number}")
+            baseline = self.core.capture()
+            self.assertEqual(baseline["initialChanges"], [])
+        self.write("a.txt", b"first work")
+        first = self.core.capture()
+        self.write("a.txt", b"second work")
+        second = self.core.capture()
+        self.store.prune({**self.config, "maxSnapshots": 2})
+        self.assertEqual({s["id"] for s in Session(self.git, self.store, self.config).timeline()}, {first["id"], second["id"]})
+        self.store.snapshot(first["id"], verify=True)
+        self.store.snapshot(baseline["id"], verify=True)
+
     def test_creation_deletion_and_rename_are_restorable(self):
         (self.root / "a.txt").rename(self.root / "renamed.txt")
         (self.root / "b.txt").unlink()
@@ -834,10 +930,12 @@ service.execute(journal, 'chore: crash boundary', [])
         self.assertEqual((self.git.context(), self.git.index_bytes()), before)
 
     def test_boundary_baseline_error_keeps_stored_timeline_readable(self):
+        self.write("a.txt", b"pending work")
+        selected = self.core.capture()
         session = Session(self.git, self.store, self.config)
         with patch.object(session.commits, "baseline", side_effect=SafetyError("Baseline unavailable")):
             timeline = session.timeline()
-            self.assertEqual(timeline[0]["id"], self.initial["id"])
+            self.assertEqual(timeline[0]["id"], selected["id"])
             self.assertEqual(timeline[0]["rangeError"], "Baseline unavailable")
             with self.assertRaises(SafetyError):
                 session.commits.review(self.initial["id"])
@@ -929,9 +1027,11 @@ service.execute(journal, 'chore: crash boundary', [])
             reader.update_metadata(selected["id"], title="must not write")
 
     def test_work_title_validation_and_clear_to_automatic_summary(self):
+        self.write("a.txt", b"pending work")
+        selected = self.core.capture()
         session, engine = Session(self.git, self.store, self.config), Engine()
         engine.sessions[self.identity["id"]] = session
-        params = {"repositoryId": self.identity["id"], "snapshotId": self.initial["id"]}
+        params = {"repositoryId": self.identity["id"], "snapshotId": selected["id"]}
         for invalid in ("a\nb", "x" * 101, None):
             with self.assertRaises(SafetyError):
                 engine.call("renameSnapshot", {**params, "title": invalid})
