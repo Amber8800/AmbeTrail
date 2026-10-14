@@ -15,7 +15,11 @@ async function scenario(): Promise<void> {
   assert.ok(extension, 'Extension must be registered');
   const api = await extension.activate(); assert.equal(api.ready, true, 'Python bridge and UI must activate');
   const commands = await vscode.commands.getCommands(true);
-  for (const name of ['captureNow', 'openDiff', 'restoreSnapshot', 'undoRestore', 'prepareCommit', 'push', 'recover']) assert.ok(commands.includes(`devSnapshot.${name}`));
+  for (const name of ['captureNow', 'openDiff', 'restoreSnapshot', 'undoRestore', 'prepareCommit', 'renameSnapshot', 'push', 'recover']) assert.ok(commands.includes(`devSnapshot.${name}`));
+  const contributions = extension.packageJSON.contributes;
+  const commitCommand = contributions.commands.find((item: { command: string }) => item.command === 'devSnapshot.prepareCommit');
+  assert.equal(commitCommand.icon, '$(git-commit)');
+  assert.ok(contributions.menus['view/item/context'].some((item: { command: string; group: string }) => item.command === 'devSnapshot.prepareCommit' && item.group.startsWith('inline')));
   const repo = process.env.DEV_SNAPSHOT_TEST_REPO!;
   for (let attempt = 0; attempt < 100; attempt++) {
     const status = await vscode.commands.executeCommand<unknown[]>('devSnapshot.refresh');

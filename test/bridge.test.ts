@@ -58,6 +58,67 @@ test('stdio bridge: handshake, Git capture, errors, and restart persistence', as
   }
 });
 
+
+test('ordered snapshot boundaries through stdio preserve latest files across restart', async () => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), 'dev-snapshot-interval-'));
+  const repo = path.join(temporary, 'repo'); await fs.mkdir(repo);
+  const git = (...args: string[]): string => {
+    const result = spawnSync('git', args, { cwd: repo, shell: false, windowsHide: true, encoding: 'utf8' });
+    assert.equal(result.status, 0); return result.stdout.trim();
+  };
+  git('init', '-b', 'main'); git('config', 'user.name', 'Boundary Test');
+  git('config', 'user.email', 'boundary@example.invalid'); git('config', 'commit.gpgsign', 'false');
+  let bridge = new PythonBridge(python, entry, root);
+  try {
+    await bridge.start();
+    const opened = await bridge.call<{ id: string }>('open', { root: repo, storageRoot: path.join(temporary, 'storage') });
+    const params = { repositoryId: opened.id };
+    await bridge.call('pause', params);
+    let state = await bridge.call<{ job?: { state: string } }[]>('list');
+    while (state[0]?.job?.state === 'running') {
+      await new Promise(resolve => setTimeout(resolve, 50));
+      state = await bridge.call('list');
+    }
+    const snapshots: string[] = [];
+    for (let number = 1; number <= 5; number++) {
+      await fs.writeFile(path.join(repo, 'a.txt'), 'work ' + number);
+      if (number === 3) await fs.writeFile(path.join(repo, 'later.txt'), 'later');
+      const job = await bridge.call<{ id: string }>('capture', params);
+      for (;;) {
+        const status = await bridge.call<{ state: string; message: string }>('job', { ...params, jobId: job.id });
+        if (status.state !== 'running') { assert.equal(status.state, 'complete', status.message); break; }
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+      snapshots.push((await bridge.call<{ id: string }[]>('timeline', params))[0]!.id);
+    }
+    const prepare = await bridge.call<{ id: string; selected: string[] }>('commitPrepare', { ...params, snapshotId: snapshots[1], approved: true });
+    assert.deepEqual(prepare.selected, ['a.txt']);
+    const staged = await bridge.call<{ right: string }>('diff', { ...params, kind: 'boundaryStaged', operationId: prepare.id, path: 'a.txt' });
+    assert.equal(staged.right, 'work 2');
+    const second = await bridge.call<{ oid: string; expected: boolean; cleanup: { token: string } }>('commitExecute', { ...params, operationId: prepare.id, message: 'chore: first interval', approved: true });
+    assert.equal(second.expected, true);
+    assert.equal(git('show', second.oid + ':a.txt'), 'work 2');
+    assert.equal(await fs.readFile(path.join(repo, 'a.txt'), 'utf8'), 'work 5');
+    await bridge.call('historyCancel', { ...params, token: second.cleanup.token });
+    await bridge.stop();
+    bridge = new PythonBridge(python, entry, root); await bridge.start();
+    await bridge.call('open', { root: repo, storageRoot: path.join(temporary, 'storage') });
+    const next = await bridge.call<{ id: string; selected: string[] }>('commitPrepare', { ...params, snapshotId: snapshots[4], approved: true });
+    assert.deepEqual(new Set(next.selected), new Set(['a.txt', 'later.txt']));
+    const fifth = await bridge.call<{ oid: string; expected: boolean; cleanup: { token: string } }>('commitExecute', { ...params, operationId: next.id, message: 'chore: second interval', approved: true });
+    assert.equal(fifth.expected, true);
+    assert.equal(git('rev-parse', fifth.oid + '^'), second.oid);
+    assert.equal(git('show', fifth.oid + ':a.txt'), 'work 5');
+    assert.equal(git('show', fifth.oid + ':later.txt'), 'later');
+    assert.equal(await fs.readFile(path.join(repo, 'a.txt'), 'utf8'), 'work 5');
+    assert.equal(git('diff', '--cached', '--name-only'), '');
+    await bridge.call('historyCancel', { ...params, token: fifth.cleanup.token });
+  } finally {
+    await bridge.stop();
+    assert.ok(path.dirname(temporary) === path.resolve(os.tmpdir()) && path.basename(temporary).startsWith('dev-snapshot-interval-'));
+    await fs.rm(temporary, { recursive: true, force: true });
+  }
+});
 test('invalid Python executable rejects startup without replay', async () => {
   const bridge = new PythonBridge(path.join(root, 'nonexistent-python-executable'), entry, root);
   await assert.rejects(bridge.start(), /Python/);
