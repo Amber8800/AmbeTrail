@@ -10,8 +10,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .common import (MAX_FILE, SafetyError, atomic_write, digest, encode, fsync_directory,
-                     is_link, read_json, sha, utc_now, validate_entries,
-                     validate_hash, validate_id, write_json)
+                     is_link, native_path, read_json, sha, utc_now, validate_entries,
+                     validate_hash, validate_id, validate_title, write_json)
 
 
 class Store:
@@ -57,7 +57,7 @@ class Store:
 
     def _clean_unpublished_temporaries(self) -> None:
         # Manifests/journals never reference these names. Keep all recovery records intact.
-        for directory, dirs, files in os.walk(self.directory, followlinks=False):
+        for directory, dirs, files in os.walk(native_path(self.directory), followlinks=False):
             if any(is_link(Path(directory) / name) for name in dirs):
                 raise SafetyError("Unexpected link in storage. Writes are disabled.")
             for name in files:
@@ -246,12 +246,14 @@ class Store:
             return {"schema": 1, "pinned": False, "validation": "unverified", "commitIds": []}
         if type(value.get("pinned")) is not bool or not isinstance(value.get("commitIds"), list):
             raise SafetyError("Invalid snapshot status metadata.")
+        validate_title(value.get("title", ""))
         return value
 
     def update_metadata(self, snapshot_id: str, **patch) -> None:
         self.assert_writer()
         value = self.metadata(snapshot_id)
         value.update(patch)
+        validate_title(value.get("title", ""))
         self.write_record("metadata", snapshot_id, value)
 
     def journal(self, value: dict) -> None:
@@ -279,6 +281,7 @@ class Store:
 
     def usage(self) -> int:
         def walk(directory: Path) -> int:
+            directory = native_path(directory)
             subtotal = 0
             with os.scandir(directory) as entries:
                 for entry in entries:
@@ -311,6 +314,16 @@ class Store:
                 protected.add(journal["backupId"])
                 if journal.get("targetId"):
                     protected.add(journal["targetId"])
+        # Keep the last successful boundary of each branch until a newer one is committed.
+        boundaries = {}
+        for source in (self.directory / "receipts").glob("*.json"):
+            receipt = read_json(source)
+            if receipt.get("mode") == "boundary" and receipt.get("expected") is True:
+                branch = receipt["branch"]
+                if branch not in boundaries or receipt["createdAt"] > boundaries[branch]["createdAt"]:
+                    boundaries[branch] = receipt
+        for receipt in boundaries.values():
+            protected.add(validate_id(receipt["snapshotIds"][0]))
         return protected
 
     def delete_snapshot(self, snapshot_id: str) -> None:
@@ -334,6 +347,7 @@ class Store:
         with self._headers_lock:
             if self.history_before(review["snapshotId"]) != review:
                 raise SafetyError("History or protection changed after review. Review cleanup again.")
+            self.snapshot(review["snapshotId"], verify=True)
             # Validate all surviving manifests before deleting any approved history.
             for header in self.snapshots():
                 self.snapshot(header["id"])
@@ -369,6 +383,8 @@ class Store:
                     live.update(e["hash"] for e in (change["before"], change["after"]) if e["state"] == "present")
                 if journal.get("indexBackupHash"):
                     live.add(validate_hash(journal["indexBackupHash"]))
+                if journal.get("mode") == "boundary" and journal.get("preparedIndexHash"):
+                    live.add(validate_hash(journal["preparedIndexHash"]))
         for source in (self.directory / "objects").glob("*/*"):
             if is_link(source) or is_link(source.parent):
                 raise SafetyError("Unexpected link in object storage.")

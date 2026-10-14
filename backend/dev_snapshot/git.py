@@ -10,9 +10,10 @@ from .common import SafetyError, digest, relative_path, sha
 
 
 class Git:
-    def __init__(self, root: Path, executable: str = "git"):
+    def __init__(self, root: Path, executable: str = "git", *, git_dir: Path | None = None, index: Path | None = None, hooks: str | None = None):
         self.root = root
         self.executable = executable
+        self.git_dir, self.isolated_index, self.hooks = git_dir, index, hooks
 
     def run(self, *args: str, data: bytes | None = None, allow_failure: bool = False,
             timeout: int = 30) -> bytes:
@@ -23,9 +24,16 @@ class Git:
             environment.pop(key, None)
         environment.update(GIT_OPTIONAL_LOCKS="0", GIT_NO_LAZY_FETCH="1",
                            GIT_TERMINAL_PROMPT="0")
+        options = []
+        if self.git_dir is not None and self.isolated_index is not None:
+            environment.update(GIT_DIR=str(self.git_dir), GIT_WORK_TREE=str(self.root), GIT_INDEX_FILE=str(self.isolated_index))
+            if os.name == "nt":
+                options.extend(["-c", "core.longpaths=true"])
+        if self.hooks is not None:
+            options.extend(["-c", "core.hooksPath=" + self.hooks])
         try:
             result = subprocess.run(
-                [self.executable, "--literal-pathspecs", "-c", "core.fsmonitor=false", *args],
+                [self.executable, "--literal-pathspecs", "-c", "core.fsmonitor=false", *options, *args],
                 cwd=self.root, env=environment, input=data,
                 **({"stdin": subprocess.DEVNULL} if data is None else {}), stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, shell=False, timeout=timeout,
@@ -70,12 +78,15 @@ class Git:
         except FileNotFoundError:
             return None
 
-    def context(self) -> dict:
+    def context(self, *, own_index_lock: bool = False) -> dict:
         git_dir = Path(self.text("rev-parse", "--absolute-git-dir"))
         index = self.index_bytes()
-        busy = any((git_dir / name).exists() for name in (
+        busy_files = (
             "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-apply",
-            "rebase-merge", "sequencer", "index.lock"))
+            "rebase-merge", "sequencer")
+        if not own_index_lock:
+            busy_files += ("index.lock",)
+        busy = any((git_dir / name).exists() for name in busy_files)
         sparse = self.text("config", "--bool", "core.sparseCheckout", allow_failure=True) == "true"
         return {"head": self.text("rev-parse", "--verify", "HEAD", allow_failure=True) or None,
                 "branch": self.text("symbolic-ref", "-q", "HEAD", allow_failure=True) or None,
@@ -119,14 +130,25 @@ class Git:
     def clean_index(self) -> bool:
         return not any(s["code"] != "??" and (s["code"][0] != " " or s["code"][1] == "A") for s in self.statuses())
 
-    def add(self, paths: list[str]) -> None:
+    def add(self, paths: list[str], *, force: bool = False) -> None:
         for name in paths:
             relative_path(name)
-        self.run("add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul",
+        self.run("add", "-A", *(["--force"] if force else []), "--pathspec-from-file=-", "--pathspec-file-nul",
                  data=("\0".join(paths) + "\0").encode("utf-8"))
 
     def tree(self) -> str:
         return self.text("write-tree")
+
+    def tree_entries(self, head: str | None) -> dict[str, tuple[str, str]]:
+        if not head:
+            return {}
+        entries = {}
+        for record in self.run("ls-tree", "-r", "-z", "--full-tree", head).decode("utf-8").split("\0"):
+            if record:
+                info, name = record.split("\t", 1)
+                mode, _, oid = info.split(" ")
+                entries[name] = (mode, oid)
+        return entries
 
     def file_content(self, name: str, *, head: str | None = None, staged: bool = False) -> bytes | None:
         relative_path(name)

@@ -72,7 +72,7 @@ def relative_path(value: Any) -> str:
 
 def is_link(path: Path) -> bool:
     try:
-        return metadata_is_link(path.lstat())
+        return metadata_is_link(native_path(path).lstat())
     except FileNotFoundError:
         return False
 
@@ -81,9 +81,19 @@ def metadata_is_link(metadata: os.stat_result) -> bool:
     return stat.S_ISLNK(metadata.st_mode) or bool(getattr(metadata, "st_file_attributes", 0) & 0x400)
 
 
+def native_path(path: Path) -> Path:
+    """Use Windows' extended namespace for filesystem calls without changing logical paths."""
+    if os.name != "nt":
+        return path
+    value = os.path.abspath(path)
+    if value.startswith("\\\\?\\"):
+        return Path(value)
+    return Path("\\\\?\\UNC\\" + value[2:] if value.startswith("\\\\") else "\\\\?\\" + value)
+
+
 def safe_path(root: Path, name: str) -> Path:
     relative_path(name)
-    root_stat = root.lstat()
+    root_stat = native_path(root).lstat()
     if metadata_is_link(root_stat) or not stat.S_ISDIR(root_stat.st_mode):
         raise SafetyError("Repository root is no longer a regular directory.")
     current = root
@@ -91,7 +101,7 @@ def safe_path(root: Path, name: str) -> Path:
     for index, part in enumerate(parts):
         current = current / part
         try:
-            metadata = current.lstat()
+            metadata = native_path(current).lstat()
         except FileNotFoundError:
             continue
         if metadata_is_link(metadata):
@@ -112,6 +122,7 @@ def fsync_directory(directory: Path) -> None:
 
 
 def atomic_write(destination: Path, content: bytes, mode: int = 0o600) -> None:
+    destination = native_path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, name = tempfile.mkstemp(prefix=".dev-snapshot-", suffix=".tmp", dir=destination.parent)
     temporary = Path(name)
@@ -133,6 +144,7 @@ def write_json(destination: Path, value: Any) -> None:
 
 
 def read_json(source: Path) -> dict:
+    source = native_path(source)
     if is_link(source) or source.stat().st_size > 64 * 1024 * 1024:
         raise SafetyError("Invalid metadata file.")
     try:
@@ -166,6 +178,12 @@ def validate_entry(entry: Any) -> dict:
     elif state == "excluded" and not isinstance(entry.get("reason"), str):
         raise SafetyError("Invalid exclusion metadata.")
     return entry
+
+
+def validate_title(value: Any) -> str:
+    if not isinstance(value, str) or len(value) > 100 or any(ord(c) < 32 or ord(c) == 127 or 0xD800 <= ord(c) <= 0xDFFF for c in value):
+        raise SafetyError("Work title must be a single line of up to 100 characters.")
+    return value.strip()
 
 
 def validate_entries(entries: Any) -> dict:
