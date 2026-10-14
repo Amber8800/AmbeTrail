@@ -52,7 +52,7 @@ class Timeline implements vscode.TreeDataProvider<Item> {
         node.id = `${repo.id}/${snapshot.id}`;
         node.description = compactTime(snapshot.endedAt);
         if (snapshot.boundaryState === 'committed') node.description += ' · 커밋됨';
-        node.tooltip = `${workTitle(snapshot)}\n${new Date(snapshot.endedAt).toLocaleString()}\n이번 기록: 파일 ${snapshot.changedFiles}개 변경 · 미검증${snapshot.metadata.pinned ? ' · 고정' : ''}${snapshot.metadata.commitIds.length ? ' · 커밋 연결' : ''}\n자동 요약: ${snapshot.summary}\n${snapshot.reason === 'initial' ? '작업 시작 상태 / Git 기준 변경' : snapshot.reason}\n커밋 버튼: 직전 커밋 경계부터 이 시점까지 / 복원 버튼: 이 스냅샷 복원\n우클릭 → 작업 이름 편집\n복원 시 객체 무결성을 검사합니다. 정상 동작을 검증한 상태는 아닙니다.\n${snapshot.comparisonPruned ? '이전 비교 기록이 삭제되어 포함 파일 기준으로 표시합니다.' : ''}`;
+        node.tooltip = `${workTitle(snapshot)}\n${new Date(snapshot.endedAt).toLocaleString()}\n이번 기록: 파일 ${snapshot.changedFiles}개 변경 · 미검증${snapshot.metadata.pinned ? ' · 고정' : ''}${snapshot.metadata.commitIds.length ? ' · 커밋 연결' : ''}\n자동 요약: ${snapshot.summary}\n${snapshot.reason === 'initial' ? '확장 시작 전에 존재하던 미커밋 작업' : snapshot.reason}\n커밋 버튼: 직전 커밋 경계부터 이 시점까지 / 복원 버튼: 이 스냅샷 복원\n우클릭 → 작업 이름 편집\n복원 시 객체 무결성을 검사합니다. 정상 동작을 검증한 상태는 아닙니다.\n${snapshot.comparisonPruned ? '이전 비교 기록이 삭제되어 포함 파일 기준으로 표시합니다.' : ''}`;
         if (snapshot.commitSummary && snapshot.commitChangedFiles != null) node.tooltip += `\n커밋 대상 구간: ${snapshot.commitSummary} · 파일 ${snapshot.commitChangedFiles}개`;
         if (snapshot.rangeError) node.tooltip += `\n커밋 구간 계산 불가: ${snapshot.rangeError}\n이번 기록의 요약은 그대로 표시합니다.`;
         node.iconPath = new vscode.ThemeIcon(snapshot.metadata.pinned ? 'pinned' : snapshot.boundaryState === 'committed' ? 'check' : 'circle-small-filled');
@@ -62,7 +62,7 @@ class Timeline implements vscode.TreeDataProvider<Item> {
         const more = new Item('more', '더 보기', repo);
         more.command = { command: 'devSnapshot.more', title: '더 보기', arguments: [more] }; result.push(more);
       }
-      if (!result.length) result.push(new Item('message', '아직 기록이 없습니다.', repo));
+      if (!result.length) result.push(new Item('message', '파일이 변경되면 작업 기록이 표시됩니다.', repo));
       return result;
     }
     if (item.kind === 'snapshot' && item.snapshot) {
@@ -314,12 +314,12 @@ class Application {
     await this.refresh();
   }
   private async manage(repo: Repository): Promise<void> {
-    const usage = await this.call<{ bytes: number; limit: number; snapshots: { id: string; endedAt: string; reason: string; protected: boolean }[] }>('usage', repo);
+    const usage = await this.call<{ bytes: number; limit: number; snapshots: { id: string; endedAt: string; reason: string; internalBaseline: boolean; protected: boolean }[] }>('usage', repo);
     const action = await vscode.window.showQuickPick(['보존 정책으로 정리', '스냅샷 삭제', repo.paused ? '자동 기록 재개' : '자동 기록 일시 중지'], { title: `기록 관리 · ${(usage.bytes / 1048576).toFixed(1)} / ${(usage.limit / 1048576).toFixed(0)} MiB` });
     if (!action) return;
     if (action === '보존 정책으로 정리') await this.call('prune', repo);
     else if (action === '스냅샷 삭제') {
-      const picked = await vscode.window.showQuickPick(usage.snapshots.filter(s => !s.protected).map(s => ({ label: `${new Date(s.endedAt).toLocaleString()} · ${s.reason}`, id: s.id })), { title: '삭제할 비보호 기록 선택 · 제외 정책 변경은 과거 기록을 지우지 않습니다' });
+      const picked = await vscode.window.showQuickPick(usage.snapshots.filter(s => !s.protected).map(s => ({ label: `${new Date(s.endedAt).toLocaleString()} · ${s.internalBaseline ? '이전 내부 비교 기준' : s.reason}`, id: s.id })), { title: '삭제할 비보호 기록 선택 · 제외 정책 변경은 과거 기록을 지우지 않습니다' });
       if (picked && await vscode.window.showWarningMessage('이 스냅샷을 영구 삭제합니까? 다른 기록에 참조되지 않는 파일 내용도 정리됩니다.', { modal: true }, '기록 삭제 승인')) await this.call('deleteSnapshot', repo, { snapshotId: picked.id, approved: true });
     } else await this.call(repo.paused ? 'resume' : 'pause', repo);
     await this.refresh();

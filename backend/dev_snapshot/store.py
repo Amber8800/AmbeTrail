@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .common import (MAX_FILE, SafetyError, atomic_write, digest, encode, fsync_directory,
-                     is_link, native_path, read_json, sha, utc_now, validate_entries,
+                     is_link, native_path, read_json, relative_path, sha, utc_now, validate_entries,
                      validate_hash, validate_id, validate_title, write_json)
 
 
@@ -191,6 +191,11 @@ class Store:
         if not isinstance(snapshot.get("context"), dict) or not isinstance(snapshot.get("endedAt"), str):
             raise SafetyError("Invalid snapshot context.")
         validate_entries(snapshot.get("entries"))
+        if "initialChanges" in snapshot:
+            if not isinstance(snapshot["initialChanges"], list):
+                raise SafetyError("Invalid initial change list.")
+            for name in snapshot["initialChanges"]:
+                relative_path(name)
         if digest(snapshot["entries"]) != snapshot.get("treeHash"):
             raise SafetyError("Snapshot manifest failed integrity verification.")
 
@@ -208,6 +213,29 @@ class Store:
     def snapshots(self) -> list[dict]:
         with self._headers_lock:
             return self._snapshot_headers()
+
+    def initial_changed_paths(self, snapshot: dict) -> list[str] | None:
+        """Use recorded startup status, never today's Git status, to classify old baselines."""
+        if snapshot["reason"] != "initial":
+            return None
+        if "initialChanges" in snapshot:
+            return snapshot["initialChanges"]
+        try:
+            epoch = read_json(self.record("epochs", snapshot["epochId"]))
+        except FileNotFoundError:
+            return None  # Missing evidence must not hide existing history.
+        paths = epoch.get("initialChanges")
+        if epoch.get("initialSnapshot") != snapshot["id"] or not isinstance(paths, list):
+            return None
+        entries = self.snapshot(snapshot["id"])["entries"]
+        return [name for name in paths if name in entries and entries[name]["state"] != "excluded"]
+
+    def is_internal_baseline(self, snapshot: dict) -> bool:
+        if snapshot["reason"] != "initial" or self.initial_changed_paths(snapshot) != []:
+            return False
+        metadata = self.metadata(snapshot["id"])
+        # Preserve records the user deliberately named, pinned, or linked to a commit.
+        return not (metadata["pinned"] or metadata.get("title") or metadata["commitIds"])
 
     def _snapshot_headers(self) -> list[dict]:
         directory = self.directory / "snapshots"
@@ -401,14 +429,15 @@ class Store:
         protected = self.protected_ids()
         for header in snapshots:
             self.snapshot(header["id"])  # Validate every manifest before deleting any history.
-        count = sum(s["reason"] != "backup" for s in snapshots)
+        count = sum(s["reason"] != "backup" and not self.is_internal_baseline(s) for s in snapshots)
         expiry = (datetime.now(timezone.utc) - timedelta(days=config["retentionDays"])).isoformat()
         for snapshot in reversed(snapshots):
             if snapshot["id"] in protected:
                 continue
             if snapshot["endedAt"] < expiry or snapshot["reason"] == "backup" or count > config["maxSnapshots"]:
+                normal_record = snapshot["reason"] != "backup" and not self.is_internal_baseline(snapshot)
                 self.delete_snapshot(snapshot["id"])
-                count -= snapshot["reason"] != "backup"
+                count -= normal_record
         self.gc()
         limit = int(config["maxStorageMiB"] * 1024 * 1024)
         if self.usage() > limit:
