@@ -1,0 +1,53 @@
+name: Amberog checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  core-and-extension:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        vscode: ['1.95.0', stable]
+    runs-on: ${{ matrix.os }}
+    env:
+      VSCODE_VERSION: ${{ matrix.vscode }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - run: npm test
+      - run: npm run build
+      - if: runner.os == 'Linux'
+        run: xvfb-run -a npm run test:integration
+      - if: runner.os != 'Linux'
+        run: npm run test:integration
+      - run: npm run package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: amberog-${{ matrix.os }}-${{ matrix.vscode }}
+          path: '*.vsix'
+  minimum-git:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build Git 2.43 in the runner temporary directory
+        shell: bash
+        run: |
+          curl --fail --location https://www.kernel.org/pub/software/scm/git/git-2.43.0.tar.xz -o "$RUNNER_TEMP/git.tar.xz"
+          tar -xJf "$RUNNER_TEMP/git.tar.xz" -C "$RUNNER_TEMP"
+          make -C "$RUNNER_TEMP/git-2.43.0" -j2 prefix="$RUNNER_TEMP/git-minimum" NO_GETTEXT=YesPlease NO_TCLTK=YesPlease install
+          echo "$RUNNER_TEMP/git-minimum/bin" >> "$GITHUB_PATH"
+      - run: python -I -S -u backend/test_runner.py

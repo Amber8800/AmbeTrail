@@ -1,0 +1,9 @@
+**
+!dist/extension.js
+!media/snapshot.svg
+!package.json
+!backend/run.py
+!backend/dev_snapshot/*.py
+!README.md
+!LICENSE
+!CHANGELOG.md

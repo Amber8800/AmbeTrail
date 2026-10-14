@@ -1,0 +1,14 @@
+node_modules/
+.npm-cache/
+.test-tmp/
+out/
+dist/
+*.vsix
+.vscode-test/
+benchmark-results.json
+log_venv/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.coverage

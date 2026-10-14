@@ -1,0 +1,464 @@
+"""Protocol-facing application service and the Python-owned recording scheduler."""
+from __future__ import annotations
+
+import os
+import time
+import threading
+from pathlib import Path
+
+from .common import (SafetyError, atomic_write, new_id, read_json,
+                     relative_path, safe_path, settings_from, utc_now)
+from .commits import CommitService
+from .git import Git
+from .restore import RestoreService, unfinished
+from .snapshots import Policy, SnapshotService, changes_between, suggest_commit
+from .store import Store
+
+
+def display_bytes(data: bytes | None) -> str:
+    if data is None:
+        return ""
+    try:
+        if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+            return data.decode("utf-16", errors="strict")
+        text = data.decode("utf-8-sig", errors="strict")
+        if "\0" not in text:
+            return text
+    except UnicodeError:
+        pass
+    from .common import sha
+    return f"[Binary or unsupported text encoding]\nBytes: {len(data)}\nSHA-256: {sha(data)}\nOriginal bytes remain preserved.\n"
+
+
+class Session:
+    def __init__(self, git: Git, store: Store, config: dict):
+        self.git, self.store = git, store
+        self.core = SnapshotService(git, store, config)
+        self.dirty: set[str] = set()
+        self.restore = RestoreService(self.core, lambda: self.dirty)
+        self.commits = CommitService(self.core, lambda: self.dirty)
+        try:
+            saved_pause = read_json(store.directory / "preferences.json").get("paused", False)
+        except FileNotFoundError:
+            saved_pause = False
+        self.paused = bool(saved_pause) or not store.writable or any(unfinished(j) for j in store.journals())
+        self.message = "읽기 전용" if not store.writable else "복구 검토 필요" if any(unfinished(j) for j in store.journals()) else "일시 중지" if self.paused else "기록 중"
+        now = time.monotonic()
+        self.last_event = now
+        self.first_event: float | None = None
+        self.reconciled = now
+        self.full_hashed = now
+        self.push_reviews: dict[str, dict] = {}
+        self.pending_paths: set[str] = set()
+        self.last_pruned = now
+        self.force_full = False
+        self.retry_after = 0.0
+        self.pending_settings: dict | None = None
+        self.history_reviews: dict[str, dict] = {}
+        self.worker: threading.Thread | None = None
+        self.job: dict | None = None
+        self.notify = lambda: None
+
+    def event(self, name: str | None = None) -> None:
+        self.core.changed()
+        if name and len(self.pending_paths) < 10000:
+            self.pending_paths.add(relative_path(name))
+        elif name:
+            self.force_full = True
+        now = time.monotonic()
+        self.last_event = now
+        if self.first_event is None:
+            self.first_event = now
+
+    def capture(self, reason: str, *, full: bool = True, changed_paths: set[str] | None = None) -> dict | None:
+        if any(unfinished(j) for j in self.store.journals()):
+            raise SafetyError("Review recovery before recording more snapshots.")
+        # Full GC is kept off the hot path unless needed; retention runs after published snapshots.
+        if self.store.cached_usage() >= self.core.config["maxStorageMiB"] * 1024 * 1024:
+            self.store.prune(self.core.config)
+        snapshot = self.core.capture(reason, full=full, changed_paths=changed_paths)
+        self.message = "기록 중" if not self.paused else "일시 중지"
+        if snapshot and (time.monotonic() - self.last_pruned >= 1800 or len(self.store.snapshots()) > self.core.config["maxSnapshots"] or self.store.cached_usage() > self.core.config["maxStorageMiB"] * 1024 * 1024 * 0.9):
+            self.store.prune(self.core.config)
+            self.last_pruned = time.monotonic()
+        return snapshot
+
+    def start_capture(self, reason: str, *, full: bool = True, changed_paths: set[str] | None = None) -> dict:
+        if self.worker and self.worker.is_alive():
+            return dict(self.job)
+        if any(unfinished(j) for j in self.store.journals()):
+            raise SafetyError("Review recovery before recording more snapshots.")
+        self.store.assert_writer()
+        self.core.cancelled.clear()
+        self.job = {"id": new_id(), "state": "running", "completed": 0, "total": 0,
+                    "snapshotId": None, "message": ""}
+        def progress(completed, total):
+            self.job.update(completed=completed, total=total)
+            self.message = f"기록 중 · {completed}/{total}"
+            self.notify()
+        self.core.progress = progress
+        def work():
+            try:
+                snapshot = self.capture(reason, full=full, changed_paths=changed_paths)
+                self.job.update(state="complete", snapshotId=snapshot["id"] if snapshot else None)
+            except Exception as error:
+                cancelled = self.core.cancelled.is_set()
+                message = str(error) if isinstance(error, SafetyError) else "Capture failed. Existing snapshots are preserved."
+                self.job.update(state="cancelled" if cancelled else "failed", message=message)
+                self.message = "일시 중지" if self.paused else "기록 취소" if cancelled else "기록 지연 · 상태 검토 필요"
+                # A failed attempt must not lose paths already removed from pending_paths.
+                self.force_full = True
+                self.retry_after = time.monotonic() + self.core.config["maxIntervalSeconds"]
+            finally:
+                self.notify()
+        self.worker = threading.Thread(target=work, name="dev-snapshot-capture", daemon=True)
+        self.worker.start()
+        return dict(self.job)
+
+    def tick(self) -> bool:
+        busy = self.worker is not None and self.worker.is_alive()
+        if self.pending_settings is not None and not busy:
+            self.core.config = self.pending_settings
+            self.pending_settings = None
+            self.core.cache.clear()
+            self.force_full = True
+            self.event()
+        if self.paused or not self.store.writable or self.restore.plans or self.history_reviews or busy or time.monotonic() < self.retry_after:
+            return False
+        now, config = time.monotonic(), self.core.config
+        full = self.force_full or now - self.full_hashed >= config["fullHashSeconds"]
+        due = self.first_event is not None and (now - self.last_event >= config["idleSeconds"] or now - self.first_event >= config["maxIntervalSeconds"])
+        reconcile = now - self.reconciled >= config["reconcileSeconds"]
+        if not (full or due or reconcile):
+            return False
+        # Advance attempts even on errors; never spin repeatedly on a full disk or unstable capture.
+        self.reconciled = now
+        if full:
+            self.full_hashed = now
+        self.first_event = None
+        try:
+            paths = set(self.pending_paths) if self.pending_paths and due and not full and not reconcile else None
+            self.pending_paths.clear()
+            result = self.start_capture("automatic", full=full, changed_paths=paths)
+            self.force_full = False
+            return result is not None
+        except (SafetyError, OSError):
+            self.message = "기록 지연 · 상태 검토 필요"
+            return True
+
+    def summary(self) -> dict:
+        snapshots = self.store.snapshots()
+        latest = next((s for s in snapshots if s["reason"] != "backup"), None)
+        return {"id": self.store.identity["id"], "root": str(self.git.root), "writable": self.store.writable,
+                "paused": self.paused, "status": self.message, "dirtyCount": len(self.dirty),
+                "latestAt": latest["endedAt"] if latest else None,
+                "branch": latest["context"]["branch"] if latest else None,
+                "excludedCount": latest.get("excludedCount", 0) if latest else 0,
+                "job": dict(self.job) if self.job else None,
+                "recoveries": [j for j in self.store.journals() if unfinished(j)]}
+
+    def timeline(self, limit: int = 50) -> list[dict]:
+        snapshots = [s for s in self.store.snapshots() if s["reason"] != "backup"]
+        indexed = {s["id"]: s for s in snapshots}
+        result = []
+        for s in snapshots[:max(1, min(limit, 1000))]:
+            previous = indexed.get(s["previousSnapshotId"], {})
+            result.append({"id": s["id"], "reason": s["reason"], "endedAt": s["endedAt"],
+                           "summary": s.get("summary", "저장된 파일 상태"), "changedFiles": s.get("changedFiles", 0),
+                           "comparisonPruned": bool(s["previousSnapshotId"] and not previous),
+                           "metadata": self.store.metadata(s["id"]), "context": s["context"]})
+        return result
+
+    def snapshot_changes(self, snapshot_id: str) -> list[dict]:
+        snapshot = self.store.snapshot(snapshot_id)
+        before = {}
+        if snapshot["previousSnapshotId"]:
+            try:
+                before = self.store.snapshot(snapshot["previousSnapshotId"])["entries"]
+            except FileNotFoundError:
+                pass
+        return changes_between(before, snapshot["entries"])
+
+    def entry_content(self, entry: dict) -> bytes | None:
+        return self.store.get(entry["hash"], entry["size"]) if entry["state"] == "present" else None
+
+    def diff(self, params: dict) -> dict:
+        name = relative_path(params["path"])
+        kind = params.get("kind", "snapshot")
+        if kind == "snapshot":
+            change = next((c for c in self.snapshot_changes(params["snapshotId"]) if c["path"] == name), None)
+            if not change:
+                raise SafetyError("This file is not a change in the selected snapshot.")
+            before, after = self.entry_content(change["before"]), self.entry_content(change["after"])
+        elif kind == "restore":
+            plan = self.restore.plans.get(params["planId"])
+            if not plan:
+                raise SafetyError("Restore review expired.")
+            change = next((c for c in plan["changes"] if c["path"] == name), None)
+            if not change:
+                raise SafetyError("File is outside the restore plan.")
+            before, after = self.entry_content(change["before"]), self.entry_content(change["after"])
+        elif kind in ("current", "staged"):
+            if Policy(self.core).exclusion(name):
+                raise SafetyError("Excluded files cannot be previewed.")
+            before = self.git.file_content(name, head=self.git.context()["head"])
+            if kind == "staged":
+                after = self.git.file_content(name, staged=True)
+            else:
+                entry = self.core.read_entry(name)
+                after = self.entry_content(entry)
+        else:
+            raise SafetyError("Unknown diff kind.")
+        return {"left": display_bytes(before), "right": display_bytes(after), "path": name,
+                "leftAbsent": before is None, "rightAbsent": after is None}
+
+
+class Engine:
+    def __init__(self, notify=lambda method, params: None):
+        self.sessions: dict[str, Session] = {}
+        self.notify = notify
+
+    def changed(self, repo_id: str, name: str | None = None) -> None:
+        session = self.sessions.get(repo_id)
+        if session:
+            session.event(name)
+
+    def dirty(self, repo_id: str, names: list[str]) -> None:
+        session = self.sessions.get(repo_id)
+        if session:
+            session.dirty = {relative_path(name) for name in names}
+
+    def session(self, params: dict) -> Session:
+        try:
+            return self.sessions[params["repositoryId"]]
+        except (KeyError, TypeError) as error:
+            raise SafetyError("Repository is not open.") from error
+
+    def tick(self) -> None:
+        for repo_id, session in list(self.sessions.items()):
+            if session.tick():
+                self.notify("changed", {"repositoryId": repo_id})
+
+    def close(self) -> None:
+        for session in self.sessions.values():
+            session.core.cancelled.set()
+        for session in self.sessions.values():
+            if session.worker:
+                session.worker.join()
+            session.store.close()
+        self.sessions.clear()
+
+    def call(self, method: str, params: dict) -> object:
+        if method == "hello":
+            return {"protocol": 1, "version": "0.1.1", "python": os.sys.version.split()[0]}
+        if method == "open":
+            config = settings_from(params.get("settings"))
+            git = Git(Path(params["root"]).resolve(strict=True), params.get("gitPath", "git"))
+            git.check_supported()
+            identity = git.identity()
+            if identity["id"] in self.sessions:
+                return self.sessions[identity["id"]].summary()
+            store = Store(Path(params["storageRoot"]).resolve() / "repositories" / identity["id"], identity)
+            try:
+                session = Session(git, store, config)
+                session.notify = lambda: self.notify("changed", {"repositoryId": identity["id"]})
+                self.sessions[identity["id"]] = session
+                if not session.paused:
+                    session.start_capture("initial")
+                return session.summary()
+            except Exception:
+                store.close()
+                self.sessions.pop(identity["id"], None)
+                raise
+        if method == "offline":
+            # A disabled built-in Git extension allows history reading but no Git execution.
+            storage = Path(params["storageRoot"]) / "repositories"
+            roots = [Path(p).resolve() for p in params.get("roots", [])]
+            for directory in storage.glob("*"):
+                identity = read_json(directory / "identity.json")
+                root = Path(identity["root"])
+                if not any(root == r or r.is_relative_to(root) for r in roots):
+                    continue
+                store = Store(directory, identity, readonly=True)
+                session = Session(Git(root), store, settings_from(None))
+                session.message = "Git 비활성 · 과거 기록 조회 전용"
+                self.sessions[identity["id"]] = session
+            return [s.summary() for s in self.sessions.values()]
+        if method == "list":
+            return [s.summary() for s in self.sessions.values()]
+        session = self.session(params)
+        store = session.store
+        busy = session.worker is not None and session.worker.is_alive()
+        if busy and method not in ("close", "timeline", "snapshotChanges", "diff", "capture", "pause", "job", "cancelCapture", "settings", "restoreCancel", "historyCancel"):
+            raise SafetyError("Snapshot capture is running. Wait for completion or pause recording to cancel it.")
+        if busy and method == "diff" and params.get("kind", "snapshot") != "snapshot":
+            raise SafetyError("Wait for the active capture before reviewing live files.")
+        if not store.writable and method not in ("close", "timeline", "snapshotChanges", "diff", "usage", "pause"):
+            raise SafetyError("This session is read-only. Only stored history is available.")
+        if not store.writable and method == "diff" and params.get("kind", "snapshot") != "snapshot":
+            raise SafetyError("Read-only sessions can only compare stored snapshots.")
+        if method == "close":
+            session.core.cancelled.set()
+            if session.worker:
+                session.worker.join()
+            store.close()
+            del self.sessions[params["repositoryId"]]
+            return None
+        if method == "settings":
+            config = settings_from(params["settings"])
+            if busy:
+                session.pending_settings = config
+                session.core.cancelled.set()
+                return None
+            session.core.config = config
+            session.core.cache.clear()
+            session.force_full = True
+            session.event()
+            return None
+        if method == "timeline":
+            return session.timeline(int(params.get("limit", 50)))
+        if method == "snapshotChanges":
+            return session.snapshot_changes(params["snapshotId"])
+        if method == "diff":
+            return session.diff(params)
+        if method == "capture":
+            result = session.start_capture("manual")
+        elif method == "job":
+            if not session.job or session.job["id"] != params["jobId"]:
+                raise SafetyError("Capture job is no longer available.")
+            return dict(session.job)
+        elif method == "cancelCapture":
+            session.core.cancelled.set()
+            return None
+        elif method == "pause":
+            session.paused = True
+            session.core.cancelled.set()
+            session.message = "일시 중지"
+            if store.writable:
+                from .common import write_json
+                write_json(store.directory / "preferences.json", {"schema": 1, "paused": True})
+            result = None
+        elif method == "resume":
+            store.assert_writer()
+            if any(unfinished(j) for j in store.journals()):
+                raise SafetyError("Review recovery before resuming.")
+            session.paused = False
+            session.message = "기록 중"
+            from .common import write_json
+            write_json(store.directory / "preferences.json", {"schema": 1, "paused": False})
+            session.event()
+            result = None
+        elif method == "restorePrepare":
+            result = session.restore.prepare(params["snapshotId"])
+        elif method == "restoreCancel":
+            session.restore.plans.pop(params["planId"], None)
+            result = None
+        elif method == "undoPrepare":
+            plan, original = session.restore.prepare_undo()
+            result = {"plan": plan, "undoes": original}
+        elif method == "restoreApply":
+            self._approved(params, writers=True)
+            result = session.restore.apply(params["planId"], kind="undo" if params.get("undoes") else "restore", undoes=params.get("undoes"))
+            session.start_capture("restored", full=False, changed_paths={c["path"] for c in result["changes"]})
+        elif method == "commitChoices":
+            return session.commits.choices()
+        elif method == "commitPrepare":
+            self._approved(params)
+            result = session.commits.prepare(params["selected"])
+        elif method == "commitExecute":
+            self._approved(params)
+            result = session.commits.execute(self._journal(session, params["operationId"]), params["message"], params.get("snapshotIds", []))
+            if result["expected"] and result["snapshotIds"]:
+                try:
+                    review = store.history_before(result["snapshotIds"][0])
+                    token = new_id()
+                    session.history_reviews[token] = {"review": review, "receiptId": result["id"]}
+                    result = {**result, "cleanup": {"token": token, **review}}
+                except (OSError, SafetyError):
+                    result = {**result, "cleanupError": True}
+        elif method == "historyCancel":
+            session.history_reviews.pop(params["token"], None)
+            result = None
+        elif method == "historyDelete":
+            self._approved(params)
+            prepared = session.history_reviews.pop(params["token"], None)
+            if not prepared:
+                raise SafetyError("Cleanup review expired. Existing history has been preserved.")
+            receipt = read_json(store.record("receipts", prepared["receiptId"]))
+            if receipt.get("expected") is not True or prepared["review"]["snapshotId"] not in receipt["snapshotIds"]:
+                raise SafetyError("Cleanup requires a verified successful commit linked to the selected snapshot.")
+            result = {"deleted": store.delete_history_before(prepared["review"])}
+        elif method == "commitCancel":
+            result = session.commits.cancel(self._journal(session, params["operationId"]))
+        elif method == "suggestCommit":
+            return suggest_commit(params["paths"])
+        elif method == "pushReview":
+            review = session.commits.push_review()
+            token = new_id()
+            session.push_reviews[token] = review
+            return {"token": token, **review}
+        elif method == "pushExecute":
+            self._approved(params)
+            review = session.push_reviews.pop(params["token"], None)
+            if not review:
+                raise SafetyError("Push review expired.")
+            result = session.commits.push(review)
+        elif method == "pin":
+            store.snapshot(params["snapshotId"])
+            result = store.update_metadata(params["snapshotId"], pinned=not store.metadata(params["snapshotId"])["pinned"])
+        elif method == "usage":
+            protected = store.protected_ids()
+            return {"bytes": store.usage(), "limit": session.core.config["maxStorageMiB"] * 1024 * 1024,
+                    "snapshots": [{"id": s["id"], "endedAt": s["endedAt"], "reason": s["reason"], "protected": s["id"] in protected} for s in store.snapshots()]}
+        elif method == "prune":
+            result = store.prune(session.core.config)
+        elif method == "deleteSnapshot":
+            self._approved(params)
+            store.delete_snapshot(params["snapshotId"])
+            result = store.gc()
+        elif method == "recoveryReport":
+            journal = self._journal(session, params["operationId"])
+            return {"journal": journal, "files": session.restore.report(journal) if journal["kind"] != "commit" else [],
+                    "currentContext": session.git.context()}
+        elif method == "recover":
+            self._approved(params, writers=True)
+            journal = self._journal(session, params["operationId"])
+            if journal["kind"] == "commit":
+                session.commits.cancel(journal)
+            else:
+                session.restore.rollback(journal)
+            result = journal
+        elif method == "resolveRecovery":
+            self._approved(params)
+            journal = self._journal(session, params["operationId"])
+            journal["phase"] = "resolved"
+            journal["resolvedAt"] = utc_now()
+            result = store.journal(journal)
+        elif method == "exportBackup":
+            self._approved(params)
+            snapshot = store.snapshot(params["snapshotId"], verify=True)
+            destination = Path(params["destination"]).resolve(strict=True)
+            if destination.is_relative_to(session.git.root) or destination.is_relative_to(store.directory):
+                raise SafetyError("Choose an export directory outside the working repository and snapshot storage.")
+            export = destination / ("dev-snapshot-recovery-" + new_id())
+            export.mkdir(mode=0o700)
+            for name, entry in snapshot["entries"].items():
+                if entry["state"] == "present":
+                    atomic_write(safe_path(export, name), store.get(entry["hash"], entry["size"]), 0o700 if entry["executable"] else 0o600)
+            result = str(export)
+        else:
+            raise SafetyError("Unknown engine method.")
+        self.notify("changed", {"repositoryId": store.identity["id"]})
+        return result
+
+    @staticmethod
+    def _approved(params: dict, *, writers: bool = False) -> None:
+        if params.get("approved") is not True or writers and params.get("writersStopped") is not True:
+            raise SafetyError("Explicit review approval is required.")
+
+    @staticmethod
+    def _journal(session: Session, operation_id: str) -> dict:
+        journal = next((j for j in session.store.journals() if j["id"] == operation_id), None)
+        if not journal:
+            raise SafetyError("Operation journal not found.")
+        return journal
