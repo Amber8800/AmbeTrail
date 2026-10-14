@@ -6,6 +6,7 @@ import os
 import re
 import stat
 import threading
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -189,8 +190,8 @@ class SnapshotService:
                             "startedAt": started, "endedAt": utc_now(), "reason": "initial" if new_epoch else reason,
                             "context": context, "policyHash": digest(self.config), "treeHash": tree_hash, "entries": entries}
                 changes = changes_between(previous["entries"] if previous else {}, entries)
-                snapshot["summary"] = summarize(changes)
-                snapshot["summaryVersion"] = 2
+                snapshot["summary"] = snapshot_summary(changes)
+                snapshot["summaryVersion"] = 3
                 snapshot["changedFiles"] = len(changes)
                 self.store.save_snapshot(snapshot)
                 return snapshot
@@ -225,6 +226,23 @@ def changes_between(before: dict, after: dict) -> list[dict]:
         kind = "added" if a["state"] == "absent" else "deleted" if b["state"] == "absent" else "modified"
         changes.append({"path": name, "kind": kind, "before": a, "after": b})
     return changes
+
+
+def snapshot_summary(changes: list[dict]) -> str:
+    """Label one capture using its actual changed paths, independent of Git commit boundaries."""
+    if not changes:
+        return "파일 변경 없음"
+    names = [c["path"].rsplit("/", 1)[-1] for c in changes]
+    repeated = {name for name, count in Counter(names).items() if count > 1}
+    labels = []
+    for change, name in zip(changes, names, strict=True):
+        if name in repeated and "/" in change["path"]:
+            name = "/".join(change["path"].split("/")[-2:])
+        name = " ".join(name.split())
+        labels.append(name if len(name) <= 28 else name[:27] + "…")
+    kinds = {c["kind"] for c in changes}
+    action = {"added": "추가", "modified": "수정", "deleted": "삭제"}.get(next(iter(kinds)), "변경") if len(kinds) == 1 else "변경"
+    return "·".join(labels[:2]) + (f" 외 {len(labels) - 2}개" if len(labels) > 2 else "") + " " + action
 
 
 def summarize(changes: list[dict]) -> str:

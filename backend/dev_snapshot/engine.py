@@ -11,7 +11,7 @@ from .common import (SafetyError, atomic_write, new_id, read_json,
 from .boundary import BoundaryCommitService
 from .git import Git
 from .restore import RestoreService, unfinished
-from .snapshots import Policy, SnapshotService, changes_between, suggest_commit, summarize
+from .snapshots import Policy, SnapshotService, changes_between, snapshot_summary, suggest_commit, summarize
 from .store import Store
 
 
@@ -183,11 +183,12 @@ class Session:
             comparison_pruned = bool(s["previousSnapshotId"] and not previous)
             summary = s.get("summary", "저장된 파일 상태")
             changed_files = s.get("changedFiles", 0)
+            commit_summary, commit_changed_files = None, None
             boundary_state = "unavailable"
-            if s.get("summaryVersion") != 2 and not comparison_pruned:
+            if s.get("summaryVersion") != 3 and not comparison_pruned:
                 key = (s["id"], comparison_pruned)
                 if key not in self.work_summaries:
-                    self.work_summaries[key] = summarize(self.snapshot_changes(s["id"]))
+                    self.work_summaries[key] = snapshot_summary(self.snapshot_changes(s["id"]))
                 summary = self.work_summaries[key]
             if baseline is not None and s["context"]["branch"] == context["branch"]:
                 if anchor and s["endedAt"] <= anchor["boundaryAt"]:
@@ -198,9 +199,10 @@ class Session:
                     if key not in self.interval_summaries:
                         changes = changes_between(baseline, self.store.snapshot(s["id"])["entries"])
                         self.interval_summaries[key] = (summarize(changes), len(changes))
-                    summary, changed_files = self.interval_summaries[key]
+                    commit_summary, commit_changed_files = self.interval_summaries[key]
             result.append({"id": s["id"], "reason": s["reason"], "endedAt": s["endedAt"],
                            "summary": summary, "changedFiles": changed_files, "boundaryState": boundary_state, "rangeError": range_error,
+                           "commitSummary": commit_summary, "commitChangedFiles": commit_changed_files,
                            "comparisonPruned": comparison_pruned,
                            "metadata": self.store.metadata(s["id"]), "context": s["context"]})
         return result

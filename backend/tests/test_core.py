@@ -788,6 +788,8 @@ service.execute(journal, 'chore: crash boundary', [])
     @unittest.skipUnless(os.name == "nt", "Windows extended path regression")
     def test_boundary_windows_long_global_storage_paths(self):
         from dev_snapshot.boundary import BoundaryCommitService
+        self.git.run("config", "core.autocrlf", "true")
+        self.git.run("config", "core.longpaths", "false")
         # Match the real default VS Code storage prefix instead of the short test prefix.
         storage_length = len(str(Path(r"C:\Users\playdata2\AppData\Roaming\Code\User\globalStorage\dev-snapshot.dev-snapshot\repositories") / self.identity["id"]))
         storage = self.base / ("storage-" + "x" * (storage_length - len(str(self.base)) - 1 - len("storage-")))
@@ -839,6 +841,57 @@ service.execute(journal, 'chore: crash boundary', [])
             self.assertEqual(timeline[0]["rangeError"], "Baseline unavailable")
             with self.assertRaises(SafetyError):
                 session.commits.review(self.initial["id"])
+
+    def test_timeline_labels_do_not_use_cumulative_commit_summary(self):
+        self.write("backend/dev_snapshot/store.py", b"store work")
+        first = self.core.capture()
+        self.write("src/extension.ts", b"UI work")
+        second = self.core.capture()
+        session = Session(self.git, self.store, self.config)
+        timeline = {s["id"]: s for s in session.timeline()}
+        self.assertEqual(timeline[first["id"]]["summary"], "store.py 추가")
+        self.assertEqual(timeline[second["id"]]["summary"], "extension.ts 추가")
+        self.assertEqual(timeline[second["id"]]["changedFiles"], 1)
+        self.assertEqual(timeline[second["id"]]["commitChangedFiles"], 2)
+        self.assertEqual(len(session.commits.review(second["id"])["changes"]), 2)
+        # A background capture must not switch row labels or file counts.
+        with patch.object(session, "worker", threading.current_thread()):
+            during = {s["id"]: s for s in session.timeline()}
+            self.assertEqual(during[second["id"]]["summary"], "extension.ts 추가")
+            self.assertEqual(during[second["id"]]["changedFiles"], 1)
+        receipt = session.commits.execute(session.commits.prepare_boundary(first["id"]), "chore: store", [])
+        self.assertTrue(receipt["expected"])
+        after = {s["id"]: s for s in session.timeline()}
+        self.assertEqual(after[second["id"]]["summary"], "extension.ts 추가")
+        self.assertEqual(after[second["id"]]["commitChangedFiles"], 1)
+        self.assertEqual(after[first["id"]]["boundaryState"], "committed")
+        self.assertEqual(len(session.commits.review(second["id"])["changes"]), 1)
+
+    def test_timeline_legacy_labels_preserve_custom_titles_and_manifest_bytes(self):
+        self.write("src/one.ts", b"one")
+        first = self.core.capture()
+        self.write("src/two.ts", b"two")
+        second = self.core.capture()
+        for record in (first, second):
+            record["summaryVersion"] = 2
+            record["summary"] = "UI 추가"
+            self.store.write_record("snapshots", record["id"], record)
+        originals = {s["id"]: self.store.record("snapshots", s["id"]).read_bytes() for s in (first, second)}
+        self.store.update_metadata(second["id"], title="사용자 작업 이름")
+        session = Session(self.git, self.store, self.config)
+        records = {s["id"]: s for s in session.timeline()}
+        self.assertEqual(records[first["id"]]["summary"], "one.ts 추가")
+        self.assertEqual(records[second["id"]]["summary"], "two.ts 추가")
+        self.assertEqual(records[second["id"]]["metadata"]["title"], "사용자 작업 이름")
+        for snapshot_id, contents in originals.items():
+            self.assertEqual(self.store.record("snapshots", snapshot_id).read_bytes(), contents)
+
+    def test_snapshot_labels_disambiguate_duplicate_file_names(self):
+        from dev_snapshot.snapshots import snapshot_summary
+        summary = snapshot_summary([{"path": "src/auth/index.ts", "kind": "modified"},
+                                    {"path": "src/api/index.ts", "kind": "modified"}])
+        self.assertIn("auth/index.ts", summary)
+        self.assertIn("api/index.ts", summary)
 
     def test_work_summary_uses_changed_files_instead_of_generic_root(self):
         from dev_snapshot.snapshots import summarize, suggest_commit
@@ -895,7 +948,7 @@ service.execute(journal, 'chore: crash boundary', [])
         self.store.write_record("snapshots", selected["id"], selected)
         original = self.store.record("snapshots", selected["id"]).read_bytes()
         session = Session(self.git, self.store, self.config)
-        self.assertEqual(session.timeline()[0]["summary"], "UI 추가")
+        self.assertEqual(session.timeline()[0]["summary"], "timeline.ts 추가")
         self.assertEqual(self.store.record("snapshots", selected["id"]).read_bytes(), original)
 
     def history_fixture(self):
