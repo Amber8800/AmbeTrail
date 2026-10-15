@@ -9,6 +9,7 @@
   let repositories = [];
   let menu;
   let busy = false;
+  let managementDialog;
 
   function element(tag, className, text) {
     const node = document.createElement(tag);
@@ -143,6 +144,93 @@
     });
     return row;
   }
+  function closeManagement() {
+    if (!managementDialog || managementDialog.busy) return;
+    const id = managementDialog.id;
+    managementDialog.element.close(); managementDialog.element.remove(); managementDialog = undefined;
+    send('managementClose', id);
+    const row = [...app.querySelectorAll('[data-id]')].find(node => node.dataset.id === id);
+    [...(row?.querySelectorAll('button') || [])].find(node => node.textContent === '관리')?.focus();
+  }
+  function managementBusy(value) {
+    if (!managementDialog) return;
+    managementDialog.busy = value;
+    for (const control of managementDialog.element.querySelectorAll('input, select, button')) {
+      control.disabled = value || control.dataset.locked === 'true';
+    }
+  }
+  function managementRequest(type, extra = {}) {
+    if (!managementDialog || managementDialog.busy) return;
+    managementDialog.pendingFocus = document.activeElement.dataset.focus;
+    managementBusy(true); managementDialog.status.className = 'dialog-status';
+    managementDialog.status.textContent = '처리 중…';
+    vscode.postMessage({ type, id: managementDialog.id, ...extra });
+  }
+  function renderManagement(id, state, noticeText = '') {
+    const focused = managementDialog?.pendingFocus || (managementDialog?.element.contains(document.activeElement) ? document.activeElement.dataset.focus : undefined);
+    if (managementDialog) { managementDialog.element.close(); managementDialog.element.remove(); }
+    const dialog = element('dialog', 'management-dialog'); dialog.setAttribute('aria-labelledby', 'management-title');
+    const header = element('div', 'dialog-header');
+    const title = element('h2', '', '기록 관리'); title.id = 'management-title';
+    const close = element('button', 'quiet dialog-close', '×'); close.type = 'button'; close.dataset.focus = 'close';
+    close.setAttribute('aria-label', '관리 창 닫기'); close.addEventListener('click', closeManagement); header.append(title, close);
+    const description = element('p', 'hint', state.name + (state.writable ? '' : ' · 읽기 전용'));
+    const status = element('p', 'dialog-status', noticeText); status.tabIndex = -1;
+    status.setAttribute('role', 'status'); status.setAttribute('aria-live', 'polite');
+    managementDialog = { element: dialog, id, status, busy: false };
+    const form = element('form', 'recording-form'); form.noValidate = true;
+    form.append(element('h3', '', '기록 주기'));
+    const inputs = new Map();
+    for (const field of state.recording) {
+      const label = element('label', 'recording-field'); label.append(element('span', 'field-title', field.label));
+      const controls = element('span', 'field-control');
+      const input = element('input'); input.type = 'number'; input.name = field.key; input.dataset.focus = field.key;
+      input.min = String(field.step); input.max = String(field.maximum); input.step = String(field.step); input.value = String(field.value);
+      input.disabled = !state.writable; input.dataset.locked = String(!state.writable);
+      const help = element('span', 'hint field-help', field.detail); help.id = `management-${field.key}-help`;
+      input.setAttribute('aria-describedby', help.id); inputs.set(field.key, input);
+      controls.append(input, element('span', 'field-unit', field.unit)); label.append(controls, help); form.append(label);
+    }
+    const footer = element('div', 'dialog-actions');
+    const save = element('button', 'primary', '주기 저장'); save.type = 'submit'; save.dataset.focus = 'save';
+    save.disabled = !state.writable; save.dataset.locked = String(!state.writable);
+    const cancel = element('button', 'secondary', '닫기'); cancel.type = 'button'; cancel.dataset.focus = 'cancel'; cancel.addEventListener('click', closeManagement);
+    footer.append(save, cancel); form.append(footer);
+    form.addEventListener('submit', event => {
+      event.preventDefault();
+      managementRequest('saveRecording', { values: Object.fromEntries([...inputs].map(([key, input]) => [key, input.value])) });
+    });
+    const history = element('section', 'dialog-history'); history.append(element('h3', '', '기록 및 저장 공간'));
+    history.append(element('p', 'hint', `${(state.usage.bytes / 1048576).toFixed(1)} / ${(state.usage.limit / 1048576).toFixed(0)} MiB 사용 · 기록 ${state.usage.snapshots.length}개`));
+    const actions = element('div', 'dialog-actions');
+    for (const [text, action] of [[state.paused ? '자동 기록 재개' : '자동 기록 일시 중지', state.paused ? 'resume' : 'pause'], ['보존 정책으로 정리', 'prune']]) {
+      const button = element('button', 'secondary', text); button.type = 'button'; button.dataset.focus = action;
+      button.disabled = !state.writable; button.dataset.locked = String(!state.writable);
+      button.addEventListener('click', () => managementRequest('managementAction', { action })); actions.append(button);
+    }
+    history.append(actions);
+    const deletion = element('label', 'recording-field'); deletion.append(element('span', 'field-title', '스냅샷 삭제'));
+    const select = element('select'); select.dataset.focus = 'snapshot';
+    const empty = element('option', '', '삭제할 기록을 선택하세요'); empty.value = ''; select.append(empty);
+    for (const snapshot of state.usage.snapshots) {
+      const option = element('option', '', `${snapshot.protected ? '[보호됨] ' : ''}${snapshot.title} · ${new Date(snapshot.endedAt).toLocaleString()}`);
+      option.value = snapshot.id; option.disabled = snapshot.protected; select.append(option);
+    }
+    select.disabled = !state.writable; select.dataset.locked = String(!state.writable); deletion.append(select);
+    const remove = element('button', 'danger secondary', '선택한 기록 삭제'); remove.type = 'button'; remove.dataset.focus = 'delete';
+    remove.disabled = true; remove.dataset.locked = 'true';
+    select.addEventListener('change', () => { remove.dataset.locked = String(!state.writable || !select.value); remove.disabled = managementDialog.busy || remove.dataset.locked === 'true'; });
+    remove.addEventListener('click', () => managementRequest('managementAction', { action: 'delete', snapshotId: select.value }));
+    history.append(deletion, remove, element('p', 'hint', '보호된 기록은 삭제할 수 없습니다. 삭제 전 최종 확인 창이 표시됩니다.'));
+    dialog.append(header, description, status, form, history);
+    dialog.addEventListener('cancel', event => { event.preventDefault(); closeManagement(); });
+    dialog.addEventListener('click', event => {
+      const bounds = dialog.getBoundingClientRect();
+      if (event.target === dialog && (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom)) closeManagement();
+    });
+    document.body.append(dialog); dialog.showModal();
+    if (focused) [...dialog.querySelectorAll('[data-focus]')].find(node => node.dataset.focus === focused)?.focus();
+  }
   function render() {
     const focused = document.activeElement;
     const focusRecord = focused?.closest('[data-id]')?.dataset.id;
@@ -200,6 +288,15 @@
       children.set(value.id, value.children);
       const row = [...app.querySelectorAll('[data-id]')].find(node => node.dataset.id === value.id);
       if (row) populateFiles(row.querySelector('.details-body'), { id: value.id });
+    } else if (value.type === 'management') {
+      busy = false; notice.textContent = ''; render();
+      renderManagement(value.id, value.state, value.notice);
+    } else if (value.type === 'managementError') {
+      if (managementDialog?.id === value.id) {
+        managementBusy(false); managementDialog.status.className = 'dialog-status dialog-error';
+        managementDialog.status.textContent = value.message;
+        managementDialog.status.focus();
+      }
     } else if (value.type === 'error') {
       busy = false; notice.textContent = value.message;
       if (value.id) { children.set(value.id, { error: value.message }); const row = [...app.querySelectorAll('[data-id]')].find(node => node.dataset.id === value.id); if (row) populateFiles(row.querySelector('.details-body'), { id: value.id }); }
