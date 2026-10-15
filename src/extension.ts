@@ -4,18 +4,13 @@ import * as path from 'node:path';
 import { PythonBridge } from './bridge';
 import { ReviewDocuments } from './documents';
 import { TimelineView } from './timelineView';
+import { HistoryUsage, ManagementState, recordingFields, recordingMaximum, recordingValue } from './management';
 import { branchColor, branchLabel, compactTime, repositoryStatus, snapshotContext, workTitle } from './presentation';
 import { AgentLinkReview, AgentReport, BoundaryReview, CaptureJob, Change, Diff, GitContext, Journal, PushReview, Receipt, Repository, RestorePlan, SnapshotItem } from './protocol';
 
 interface GitRepository { rootUri: vscode.Uri; state: { onDidChange: vscode.Event<void> } }
 interface GitApi { git: { path: string }; repositories: GitRepository[]; onDidOpenRepository: vscode.Event<GitRepository>; onDidCloseRepository: vscode.Event<GitRepository> }
 interface GitExtension { enabled: boolean; getAPI(version: 1): GitApi; onDidChangeEnablement: vscode.Event<boolean> }
-
-interface HistorySnapshot {
-  id: string; endedAt: string; reason: string; internalBaseline: boolean; protected: boolean;
-  title: string; context: GitContext;
-}
-interface HistoryUsage { bytes: number; limit: number; snapshots: HistorySnapshot[] }
 
 type Kind = 'repository' | 'snapshot' | 'file' | 'message' | 'recovery' | 'more' | 'agent';
 class Item extends vscode.TreeItem {
@@ -34,6 +29,11 @@ class Timeline implements vscode.TreeDataProvider<Item> {
   readonly limits = new Map<string, number>();
   constructor(readonly app: Application) {}
   get showAgentReports(): boolean { return vscode.workspace.getConfiguration('devSnapshot').get<boolean>('showAgentReports', false); }
+  management(repo: Repository): Promise<ManagementState> { return this.app.management(repo); }
+  saveRecording(repo: Repository, values: unknown): Promise<void> { return this.app.saveRecording(repo, values); }
+  manageAction(repo: Repository, action: 'pause' | 'resume' | 'prune' | 'delete', snapshotId?: string): Promise<void> {
+    return this.app.manageAction(repo, action, snapshotId);
+  }
   refresh(): void { this.emitter.fire(undefined); }
   getTreeItem(item: Item): vscode.TreeItem { return item; }
   async getChildren(item?: Item): Promise<Item[]> {
@@ -148,6 +148,7 @@ class Application {
   private gitApi?: GitApi;
   private stopped = false;
   private errorShown = new Set<string>();
+  private view?: TimelineView;
   commitExclusions(repo: Repository, snapshot: SnapshotItem): Set<string> {
     return new Set(this.context.workspaceState.get<Record<string, string[]>>('commitExclusions', {})[`${repo.id}/${snapshot.id}`] ?? []);
   }
@@ -160,6 +161,7 @@ class Application {
   constructor(readonly context: vscode.ExtensionContext, readonly bridge: PythonBridge, private readonly python: string) {}
   async start(): Promise<void> {
     const view = new TimelineView(this.timeline, this.context.extensionUri);
+    this.view = view;
     this.context.subscriptions.push(view, vscode.window.registerWebviewViewProvider('devSnapshot.timeline', view), vscode.workspace.registerTextDocumentContentProvider('dev-snapshot', this.documents));
     this.commands();
     this.bridge.on('changed', () => this.scheduleRefresh());
@@ -407,14 +409,48 @@ class Application {
     await this.refresh();
   }
   private async manage(repo: Repository): Promise<void> {
-    const usage = await this.call<HistoryUsage>('usage', repo);
-    const action = await vscode.window.showQuickPick(['보존 정책으로 정리', '스냅샷 삭제', repo.paused ? '자동 기록 재개' : '자동 기록 일시 중지'], { title: `기록 관리 · ${(usage.bytes / 1048576).toFixed(1)} / ${(usage.limit / 1048576).toFixed(0)} MiB` });
-    if (!action) return;
-    if (action === '보존 정책으로 정리') await this.call('prune', repo);
-    else if (action === '스냅샷 삭제') {
-      const picked = await vscode.window.showQuickPick(usage.snapshots.filter(s => !s.protected).map(s => ({ label: s.title, description: compactTime(s.endedAt), detail: `${snapshotContext(s.context).replace('\n', ' · ')}${s.internalBaseline ? ' · 이전 내부 비교 기준' : s.reason === 'backup' ? ' · 보호 기간이 끝난 백업' : ''}`, id: s.id })), { title: '삭제할 비보호 기록 선택 · 제외 정책 변경은 과거 기록을 지우지 않습니다' });
-      if (picked) await this.deleteSnapshot(repo, picked);
-    } else await this.call(repo.paused ? 'resume' : 'pause', repo);
+    await this.view?.openManagement(repo.id);
+  }
+  async management(repo: Repository): Promise<ManagementState> {
+    const config = vscode.workspace.getConfiguration('devSnapshot', vscode.Uri.file(repo.root));
+    return { name: path.basename(repo.root), writable: repo.writable, paused: repo.paused,
+      usage: await this.call<HistoryUsage>('usage', repo),
+      recording: recordingFields.map(field => ({ ...field,
+        value: config.get<number>(field.key, field.fallback) / field.scale, maximum: recordingMaximum(field) })),
+    };
+  }
+  async saveRecording(repo: Repository, values: unknown): Promise<void> {
+    if (!repo.writable) throw new Error('읽기 전용 저장소에서는 기록 주기를 변경할 수 없습니다.');
+    if (!values || typeof values !== 'object' || Array.isArray(values)
+      || Object.keys(values).length !== recordingFields.length
+      || !recordingFields.every(field => Object.prototype.hasOwnProperty.call(values, field.key))) throw new Error('기록 주기 설정 형식이 올바르지 않습니다.');
+    const resource = vscode.Uri.file(repo.root);
+    const config = vscode.workspace.getConfiguration('devSnapshot', resource);
+    const target = vscode.workspace.getWorkspaceFolder(resource) ? vscode.ConfigurationTarget.WorkspaceFolder
+      : vscode.workspace.workspaceFolders?.length ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
+    const updates = recordingFields.map(field => {
+      const current = config.get<number>(field.key, field.fallback);
+      const next = recordingValue(field, (values as Record<string, unknown>)[field.key], current);
+      const previous = config.inspect<number>(field.key);
+      const saved = target === vscode.ConfigurationTarget.WorkspaceFolder ? previous?.workspaceFolderValue
+        : target === vscode.ConfigurationTarget.Workspace ? previous?.workspaceValue : previous?.globalValue;
+      return { key: field.key, next, current, saved };
+    }).filter(update => update.next !== update.current);
+    const applied: typeof updates = [];
+    try {
+      for (const update of updates) { await config.update(update.key, update.next, target); applied.push(update); }
+    } catch (error) {
+      for (const update of applied.reverse()) {
+        // Preserve any external settings edit that happened during the save.
+        if (config.get(update.key) === update.next) await config.update(update.key, update.saved, target);
+      }
+      throw error;
+    }
+  }
+  async manageAction(repo: Repository, action: 'pause' | 'resume' | 'prune' | 'delete', snapshotId?: string): Promise<void> {
+    if (!repo.writable) throw new Error('읽기 전용 저장소에서는 기록을 관리할 수 없습니다.');
+    if (action === 'delete' && snapshotId) await this.deleteSnapshot(repo, { id: snapshotId });
+    else if (action !== 'delete') await this.call(action, repo);
     await this.refresh();
   }
   private async capture(repo: Repository): Promise<void> {
@@ -508,6 +544,7 @@ class Application {
     register('pinSnapshot', async (repo, item) => { const snapshot = await this.snapshot(repo, item); if (snapshot) await this.call('pin', repo, { snapshotId: snapshot.id }); });
     register('deleteSnapshot', async (repo, item) => { const snapshot = await this.snapshot(repo, item); if (snapshot) await this.deleteSnapshot(repo, snapshot); });
     register('manageHistory', repo => this.manage(repo));
+    register('recordingSettings', repo => this.manage(repo));
     register('recover', (repo, item) => this.recover(repo, item));
     register('more', async repo => { this.timeline.limits.set(repo.id, (this.timeline.limits.get(repo.id) ?? 50) + 50); this.timeline.refresh(); });
     register('openDiff', async (repo, item) => {

@@ -25,7 +25,12 @@ async function harness(snapshots = [snapshot('selected')], workspaceValues = new
     picks: [] as unknown[], pickItems: [] as { label: string; detail?: string }[][], deleteError: undefined as Error | undefined,
     commitChanges: undefined as Change[] | undefined, documents: [] as string[], input: undefined as string | undefined, workspaceValues,
     agentReports: [] as AgentReport[], showAgentReports: false,
+    configuration: new Map<string, unknown>(), configurationUpdates: [] as { key: string; value: unknown; target: number }[],
+    configurationFailure: undefined as string | undefined,
+    inputOptions: [] as vscode.InputBoxOptions[],
   };
+  const configurationDefaults = JSON.parse(readFileSync(path.resolve(__dirname, '../../package.json'), 'utf8')).contributes.configuration.properties;
+  let configurationChanged: ((event: { affectsConfiguration: (key: string) => boolean }) => void) | undefined;
   let provider: vscode.TreeDataProvider<vscode.TreeItem> | undefined;
   let webviewProvider: { source: typeof provider; resolveWebviewView(view: unknown): void; dispose(): void };
   let receiveMessage: (message: unknown) => void;
@@ -66,6 +71,8 @@ async function harness(snapshots = [snapshot('selected')], workspaceValues = new
         if (state.deleteError) throw state.deleteError;
         state.snapshots = state.snapshots.filter(s => s.id !== params.snapshotId);
       }
+      if (method === 'pause') repo.paused = true;
+      if (method === 'resume') repo.paused = false;
     }
   }
   const mockVscode = {
@@ -76,7 +83,8 @@ async function harness(snapshots = [snapshot('selected')], workspaceValues = new
     EventEmitter: class { event = event; fire() {} },
     UIKind: { Desktop: 1 }, ExtensionMode: { Development: 2 }, env: { uiKind: 1 },
     ProgressLocation: { Notification: 1 },
-    Uri: { joinPath: (_base: unknown, ...parts: string[]) => parts.join('/') },
+    ConfigurationTarget: { Global: 1, Workspace: 2, WorkspaceFolder: 3 },
+    Uri: { joinPath: (_base: unknown, ...parts: string[]) => parts.join('/'), file: (fsPath: string) => ({ fsPath, scheme: 'file' }) },
     extensions: { getExtension: () => undefined },
     commands: {
       registerCommand: (id: string, action: (item?: vscode.TreeItem) => Promise<unknown>) => { commands.set(id, action); return disposable; },
@@ -84,18 +92,26 @@ async function harness(snapshots = [snapshot('selected')], workspaceValues = new
     },
     workspace: {
       isTrusted: true, workspaceFolders: [], textDocuments: [],
-      getConfiguration: () => ({ inspect: () => undefined, get: (key: string, fallback: unknown) => key === 'showAgentReports' ? state.showAgentReports : fallback }), registerTextDocumentContentProvider: event,
-      onDidSaveTextDocument: event, onDidChangeTextDocument: event, onDidCloseTextDocument: event, onDidChangeConfiguration: event,
+      getConfiguration: () => ({ inspect: (key: string) => state.configuration.has(key) ? { workspaceFolderValue: state.configuration.get(key) } : undefined,
+        get: (key: string, fallback: unknown) => key === 'showAgentReports' ? state.showAgentReports : state.configuration.get(key) ?? configurationDefaults[`devSnapshot.${key}`]?.default ?? fallback,
+        update: async (key: string, value: unknown, target: number) => {
+          if (state.configurationFailure === key) throw new Error('설정 파일 쓰기 실패');
+          state.configurationUpdates.push({ key, value, target }); state.configuration.set(key, value);
+          configurationChanged?.({ affectsConfiguration: section => section === 'devSnapshot' || section === `devSnapshot.${key}` });
+        },
+      }), getWorkspaceFolder: () => ({ uri: { fsPath: repo.root } }), registerTextDocumentContentProvider: event,
+      onDidSaveTextDocument: event, onDidChangeTextDocument: event, onDidCloseTextDocument: event,
+      onDidChangeConfiguration: (listener: typeof configurationChanged) => { configurationChanged = listener; return disposable; },
     },
     window: {
       registerWebviewViewProvider: (_id: string, value: typeof webviewProvider) => { webviewProvider = value; provider = value.source; return disposable; },
       showInformationMessage: async (message: string) => { state.messages.push(message); },
       showErrorMessage: async (message: string) => { state.errors.push(message); },
       showWarningMessage: async (message: string) => { state.warnings.push(message); return state.warningChoice; },
-      showInputBox: async () => state.input,
+      showInputBox: async (options: vscode.InputBoxOptions) => { state.inputOptions.push(options); return state.input; },
       withProgress: async (_options: unknown, task: () => Promise<unknown>) => task(),
       showQuickPick: async (items: { label: string; detail?: string }[]) => {
-        state.pickItems.push(items); const picked = state.picks.shift(); return typeof picked === 'function' ? picked() : picked;
+        state.pickItems.push(items); const picked = state.picks.shift(); return typeof picked === 'function' ? picked(items) : picked;
       },
     },
   };
@@ -213,23 +229,115 @@ test('backend refusal after approval is reported and preserves the record', asyn
 });
 
 test('history management shares deletion confirmation and reloads protection after selection', async t => {
-  const h = await harness(); t.after(h.stop);
-  h.state.picks = ['스냅샷 삭제', { id: 'selected' }];
-  h.state.warningChoice = '기록 삭제 승인';
+  const h = await harness(); t.after(h.stop); h.openView();
   await h.command('devSnapshot.manageHistory');
-  assert.match(h.state.pickItems[1]![0]!.detail!, /브랜치: main/);
-  assert.equal(h.state.calls.filter(c => c.method === 'usage').length, 2);
+  const id = h.viewMessages.find(m => m.type === 'management')!.id;
+  await h.message({ type: 'managementAction', id, action: 'delete', snapshotId: 'selected' });
+  assert.equal(h.state.calls.filter(c => c.method === 'deleteSnapshot').length, 0);
+  h.state.warningChoice = '기록 삭제 승인';
+  await h.message({ type: 'managementAction', id, action: 'delete', snapshotId: 'selected' });
   assert.equal(h.state.calls.filter(c => c.method === 'deleteSnapshot').length, 1);
   assert.match(h.state.warnings[0]!, /작업: 작업 이름/);
+  assert.equal(h.state.pickItems.length, 0);
 });
 
-test('history management stops if the selected record becomes protected while the picker is open', async t => {
-  const h = await harness(); t.after(h.stop);
-  h.state.picks = ['스냅샷 삭제', () => { h.state.protected.add('selected'); return { id: 'selected' }; }];
+test('management popup rechecks protection before deleting a previously selectable record', async t => {
+  const h = await harness(); t.after(h.stop); h.openView();
   await h.command('devSnapshot.manageHistory');
+  const id = h.viewMessages.find(m => m.type === 'management')!.id;
+  h.state.protected.add('selected');
+  await h.message({ type: 'managementAction', id, action: 'delete', snapshotId: 'selected' });
   assert.match(h.state.messages.at(-1)!, /보호된 기록/);
   assert.equal(h.state.warnings.length, 0);
   assert.equal(h.state.calls.filter(c => c.method === 'deleteSnapshot').length, 0);
+});
+
+test('management popup saves all intervals in their displayed units and updates the live backend', async t => {
+  const h = await harness(); t.after(h.stop); h.openView();
+  h.state.configuration.set('reconcileSeconds', 180);
+  await h.command('devSnapshot.recordingSettings');
+  const id = h.viewMessages.find(m => m.type === 'management')!.id;
+  await h.message({ type: 'saveRecording', id, values: { idleSeconds: '15', maxIntervalSeconds: '3', fullHashSeconds: '15' } });
+  for (const [key, seconds] of [['idleSeconds', 15], ['maxIntervalSeconds', 180], ['fullHashSeconds', 900]] as const) {
+    const update = h.state.configurationUpdates.find(item => item.key === key)!;
+    assert.equal(update.key, key); assert.equal(update.value, seconds); assert.equal(update.target, 3);
+    const settings = h.state.calls.filter(c => c.method === 'settings').at(-1)!.params.settings as Record<string, unknown>;
+    assert.equal(settings[key], seconds); assert.equal(settings.reconcileSeconds, 180);
+  }
+  assert.equal(h.state.configurationUpdates.length, 3);
+  assert.equal(h.state.warnings.length, 0);
+});
+
+test('management opens one popup with unchanged defaults and closing it does not save', async t => {
+  const h = await harness(); t.after(h.stop); h.openView();
+  await h.command('devSnapshot.manageHistory');
+  const popup = h.viewMessages.find(m => m.type === 'management')!;
+  assert.deepEqual(Array.from(popup.state.recording, (field: { value: number }) => field.value), [5, 1, 10]);
+  assert.equal(h.state.pickItems.length, 0); assert.equal(h.state.inputOptions.length, 0);
+  assert.equal(h.state.configurationUpdates.length, 0);
+  await h.message({ type: 'managementClose', id: popup.id });
+  await h.message({ type: 'saveRecording', id: popup.id, values: { idleSeconds: 15, maxIntervalSeconds: 3, fullHashSeconds: 15 } });
+  assert.equal(h.state.configurationUpdates.length, 0);
+});
+
+test('recording settings reject fractional, off-step and excessive values and do not write read-only repositories', async t => {
+  const h = await harness(); t.after(h.stop); h.openView();
+  await h.command('devSnapshot.manageHistory');
+  const id = h.viewMessages.find(m => m.type === 'management')!.id;
+  for (const [key, values] of [
+    ['idleSeconds', ['0', '3', '5.5', 'NaN', '1000005']],
+    ['maxIntervalSeconds', ['0', '-1', '1.5', '16667']],
+    ['fullHashSeconds', ['0', '7', '5.5', '16670']],
+  ] as const) {
+    for (const input of values) {
+      const errors = h.viewMessages.filter(m => m.type === 'managementError').length;
+      await h.message({ type: 'saveRecording', id, values: { idleSeconds: 5, maxIntervalSeconds: 1, fullHashSeconds: 10, [key]: input } });
+      assert.equal(h.viewMessages.filter(m => m.type === 'managementError').length, errors + 1);
+    }
+  }
+  assert.equal(h.state.configurationUpdates.length, 0);
+  h.repo.writable = false;
+  await h.message({ type: 'saveRecording', id, values: { idleSeconds: 15, maxIntervalSeconds: 3, fullHashSeconds: 15 } });
+  assert.match(h.viewMessages.at(-1)!.message, /읽기 전용/);
+  assert.equal(h.state.configurationUpdates.length, 0);
+});
+
+test('popup rejects forged actions and snapshot IDs and supports pause, resume and prune', async t => {
+  const h = await harness(); t.after(h.stop); h.openView();
+  await h.command('devSnapshot.manageHistory');
+  const id = h.viewMessages.find(m => m.type === 'management')!.id;
+  for (const action of [{ action: 'delete', snapshotId: 'forged' }, { action: 'push' }, { action: 'restoreApply' }, { action: {} }]) {
+    await h.message({ type: 'managementAction', id, ...action });
+  }
+  assert.equal(h.state.calls.some(c => ['deleteSnapshot', 'push', 'restoreApply'].includes(c.method)), false);
+  for (const action of ['resume', 'pause', 'prune']) await h.message({ type: 'managementAction', id, action });
+  assert.equal(h.state.calls.filter(c => ['resume', 'pause', 'prune'].includes(c.method)).length, 3);
+});
+
+test('popup validates every field before writing and rolls back previous fields on a save failure', async t => {
+  const h = await harness(); t.after(h.stop); h.openView();
+  h.state.configuration.set('idleSeconds', 10);
+  await h.command('devSnapshot.manageHistory');
+  const id = h.viewMessages.find(m => m.type === 'management')!.id;
+  await h.message({ type: 'saveRecording', id, values: { idleSeconds: 15, maxIntervalSeconds: 3, fullHashSeconds: 7 } });
+  assert.equal(h.state.configurationUpdates.length, 0);
+  h.state.configurationFailure = 'maxIntervalSeconds';
+  await h.message({ type: 'saveRecording', id, values: { idleSeconds: 15, maxIntervalSeconds: 3, fullHashSeconds: 15 } });
+  assert.equal(h.state.configuration.get('idleSeconds'), 10);
+  assert.match(h.viewMessages.at(-1)!.message, /설정 파일 쓰기 실패/);
+});
+
+test('popup preserves finer legacy intervals unless edited', async t => {
+  const h = await harness(); t.after(h.stop); h.openView();
+  h.state.configuration.set('idleSeconds', 1);
+  h.state.configuration.set('maxIntervalSeconds', 5);
+  await h.command('devSnapshot.manageHistory');
+  const id = h.viewMessages.find(m => m.type === 'management')!.id;
+  await h.message({ type: 'saveRecording', id, values: { idleSeconds: 1, maxIntervalSeconds: String(5 / 60), fullHashSeconds: 15 } });
+  assert.equal(h.state.configurationUpdates.length, 1);
+  assert.equal(h.state.configuration.get('idleSeconds'), 1);
+  assert.equal(h.state.configuration.get('maxIntervalSeconds'), 5);
+  assert.equal(h.state.configuration.get('fullHashSeconds'), 900);
 });
 
 test('webview serializes host data safely, lazily loads files and only runs allowed actions on known IDs', async t => {

@@ -136,7 +136,9 @@ class Session:
         now, config = time.monotonic(), self.core.config
         full = self.force_full or now - self.full_hashed >= config["fullHashSeconds"]
         due = self.first_event is not None and (now - self.last_event >= config["idleSeconds"] or now - self.first_event >= config["maxIntervalSeconds"])
-        reconcile = now - self.reconciled >= config["reconcileSeconds"]
+        # Reconcile missed watcher events while idle, without bypassing a user's
+        # longer recording delay for changes that are already being tracked.
+        reconcile = self.first_event is None and now - self.reconciled >= config["reconcileSeconds"]
         if not (full or due or reconcile):
             return False
         # Advance attempts even on errors; never spin repeatedly on a full disk or unstable capture.

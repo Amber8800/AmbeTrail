@@ -93,3 +93,25 @@ body.vscode-high-contrast button, body.vscode-high-contrast-light button { borde
 /* Agent reports remain text-only metadata beside the existing file records. */
 .agent-report { border-left-color: var(--vscode-descriptionForeground); }
 .agent-excerpt { white-space: pre-wrap; overflow-wrap: anywhere; }
+.management-dialog { width: calc(100% - 20px); max-width: 620px; max-height: calc(100vh - 24px); margin: auto; padding: 16px; overflow: auto; color: var(--vscode-foreground); background: var(--vscode-editor-background); border: 1px solid var(--vscode-widget-border, var(--vscode-panel-border)); border-radius: 9px; box-shadow: 0 8px 28px var(--vscode-widget-shadow); }
+.management-dialog::backdrop { background: rgba(0, 0, 0, .5); }
+.dialog-header, .field-control, .dialog-actions { display: flex; align-items: center; gap: 8px; }
+.dialog-header { justify-content: space-between; }
+.dialog-header h2 { margin: 0; font-size: 15px; }
+.dialog-close { font-size: 21px; line-height: 1; }
+.management-dialog h3 { margin: 14px 0 10px; font-size: 12px; }
+.recording-field { display: grid; gap: 5px; margin: 0 0 12px; }
+.field-title { font-size: 12px; }
+.field-control input { flex: 1; min-width: 0; }
+.management-dialog input, .management-dialog select { width: 100%; min-width: 0; padding: 6px 8px; border: 1px solid var(--vscode-input-border, var(--vscode-panel-border)); border-radius: 4px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); font: inherit; }
+.management-dialog select { text-overflow: ellipsis; }
+.management-dialog input:focus-visible, .management-dialog select:focus-visible { outline: 1px solid var(--vscode-focusBorder); outline-offset: 1px; }
+.management-dialog input:disabled, .management-dialog select:disabled { opacity: .5; }
+.field-unit { flex: none; font-size: 12px; }
+.field-help { margin: 0; }
+.dialog-actions { flex-wrap: wrap; margin: 12px 0; }
+.dialog-actions button { font-size: 11px; }
+.dialog-status { margin: 5px 0; font-size: 11px; overflow-wrap: anywhere; }
+.dialog-status:empty { display: none; }
+.dialog-error { color: var(--vscode-errorForeground); }
+.dialog-history { padding-top: 2px; border-top: 1px solid var(--vscode-panel-border); }
