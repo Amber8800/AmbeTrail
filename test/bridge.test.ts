@@ -79,6 +79,8 @@ test('ordered snapshot boundaries through stdio preserve latest files across res
       await new Promise(resolve => setTimeout(resolve, 50));
       state = await bridge.call('list');
     }
+    assert.deepEqual(await bridge.call('timeline', params), [], 'Clean startup remains an internal baseline');
+    assert.equal((await bridge.call<{ latestAt: string | null }[]>('list'))[0]!.latestAt, null);
     const snapshots: string[] = [];
     for (let number = 1; number <= 5; number++) {
       await fs.writeFile(path.join(repo, 'a.txt'), 'work ' + number);
@@ -103,16 +105,32 @@ test('ordered snapshot boundaries through stdio preserve latest files across res
     await bridge.stop();
     bridge = new PythonBridge(python, entry, root); await bridge.start();
     await bridge.call('open', { root: repo, storageRoot: path.join(temporary, 'storage') });
-    const next = await bridge.call<{ id: string; selected: string[] }>('commitPrepare', { ...params, snapshotId: snapshots[4], approved: true });
-    assert.deepEqual(new Set(next.selected), new Set(['a.txt', 'later.txt']));
-    const fifth = await bridge.call<{ oid: string; expected: boolean; cleanup: { token: string } }>('commitExecute', { ...params, operationId: next.id, message: 'chore: second interval', approved: true });
+    const next = await bridge.call<{ id: string; selected: string[] }>('commitPrepare', { ...params, snapshotId: snapshots[4], selected: ['a.txt'], approved: true });
+    assert.deepEqual(next.selected, ['a.txt']);
+    const fifth = await bridge.call<{ oid: string; expected: boolean; partial: boolean; cleanup?: { token: string } }>('commitExecute', { ...params, operationId: next.id, message: 'chore: second interval code', approved: true });
     assert.equal(fifth.expected, true);
     assert.equal(git('rev-parse', fifth.oid + '^'), second.oid);
     assert.equal(git('show', fifth.oid + ':a.txt'), 'work 5');
-    assert.equal(git('show', fifth.oid + ':later.txt'), 'later');
+    assert.equal(fifth.partial, true); assert.equal(fifth.cleanup, undefined);
+    assert.equal(git('ls-tree', '--name-only', fifth.oid, '--', 'later.txt'), '');
     assert.equal(await fs.readFile(path.join(repo, 'a.txt'), 'utf8'), 'work 5');
     assert.equal(git('diff', '--cached', '--name-only'), '');
-    await bridge.call('historyCancel', { ...params, token: fifth.cleanup.token });
+    await bridge.stop();
+    bridge = new PythonBridge(python, entry, root); await bridge.start();
+    await bridge.call('open', { root: repo, storageRoot: path.join(temporary, 'storage') });
+    for (;;) {
+      const repos = await bridge.call<{ job?: { state: string } }[]>('list');
+      if (repos[0]?.job?.state !== 'running') break;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    const remaining = await bridge.call<{ changes: { path: string }[]; reviewHash: string }>('commitBoundaryReview', { ...params, snapshotId: snapshots[4] });
+    assert.deepEqual(remaining.changes.map(c => c.path), ['later.txt']);
+    const finalPrepared = await bridge.call<{ id: string }>('commitPrepare', { ...params, snapshotId: snapshots[4], selected: ['later.txt'], reviewHash: remaining.reviewHash, approved: true });
+    const final = await bridge.call<{ oid: string; expected: boolean; cleanup: { token: string } }>('commitExecute', { ...params, operationId: finalPrepared.id, message: 'docs: separate file', approved: true });
+    assert.equal(final.expected, true); assert.equal(git('rev-parse', final.oid + '^'), fifth.oid);
+    assert.equal(git('show', final.oid + ':later.txt'), 'later');
+    assert.equal(git('show', final.oid + ':a.txt'), 'work 5');
+    await bridge.call('historyCancel', { ...params, token: final.cleanup.token });
   } finally {
     await bridge.stop();
     assert.ok(path.dirname(temporary) === path.resolve(os.tmpdir()) && path.basename(temporary).startsWith('dev-snapshot-interval-'));

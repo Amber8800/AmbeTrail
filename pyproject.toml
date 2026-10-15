@@ -1,7 +1,7 @@
 [project]
 name = "dev-snapshot-core"
-version = "0.1.3"
-description = "Local snapshot, recovery, and Git engine for Amberog"
+version = "0.2.1"
+description = "Local snapshot, recovery, and Git engine for AmberTrail"
 requires-python = ">=3.12"
 dependencies = []
 

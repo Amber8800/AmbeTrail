@@ -73,6 +73,206 @@ class CoreTests(unittest.TestCase):
         self.assertIsNone(self.core.capture())
         self.assertEqual(len(self.store.snapshots()), 1)
 
+    def test_clean_start_is_internal_and_first_change_compares_with_it(self):
+        session = Session(self.git, self.store, self.config)
+        before = self.git.context(), self.git.index_bytes()
+        self.assertEqual(self.initial["initialChanges"], [])
+        self.assertEqual(session.timeline(), [])
+        self.assertIsNone(session.summary()["latestAt"])
+        size = self.store.usage()
+        restarted = SnapshotService(self.git, self.store, self.config)
+        self.assertIsNone(restarted.capture("initial"))
+        self.assertEqual(self.store.usage(), size)
+        self.write("a.txt", b"first work")
+        first = restarted.capture()
+        self.assertEqual(first["previousSnapshotId"], self.initial["id"])
+        self.assertEqual([s["id"] for s in session.timeline()], [first["id"]])
+        changes = session.snapshot_changes(first["id"])
+        self.assertEqual([(c["path"], c["kind"]) for c in changes], [("a.txt", "modified")])
+        self.assertEqual(session.diff({"snapshotId": first["id"], "path": "a.txt"})["left"], "baseline\r\n")
+        self.write("a.txt", b"later work")
+        self.core.capture()
+        restore = RestoreService(self.core)
+        restore.apply(restore.prepare(first["id"])["id"])
+        self.assertEqual((self.root / "a.txt").read_bytes(), b"first work")
+        self.assertEqual((self.git.context(), self.git.index_bytes()), before)
+
+    def test_startup_with_existing_work_records_only_managed_changed_paths(self):
+        self.write("a.txt", b"existing modification")
+        self.write("b.txt", b"already staged")
+        self.git.add(["b.txt"])
+        self.write("new.txt", b"untracked work")
+        self.write(".env", b"excluded secret")
+        store = Store(self.base / "dirty-start", self.identity)
+        self.addCleanup(store.close)
+        before = self.git.context(), self.git.index_bytes()
+        core = SnapshotService(self.git, store, self.config)
+        startup = core.capture("initial")
+        session = Session(self.git, store, self.config)
+        self.assertEqual(startup["initialChanges"], ["a.txt", "b.txt", "new.txt"])
+        self.assertEqual(session.timeline()[0]["changedFiles"], 3)
+        self.assertEqual({c["path"] for c in session.snapshot_changes(startup["id"])}, {"a.txt", "b.txt", "new.txt"})
+        self.assertEqual(store.get(startup["entries"]["new.txt"]["hash"]), b"untracked work")
+        self.assertEqual((self.git.context(), self.git.index_bytes()), before)
+
+    def test_excluded_only_startup_changes_do_not_create_a_visible_record(self):
+        self.write(".env", b"excluded secret")
+        store = Store(self.base / "excluded-start", self.identity)
+        self.addCleanup(store.close)
+        startup = SnapshotService(self.git, store, self.config).capture("initial")
+        self.assertEqual(startup["initialChanges"], [])
+        self.assertEqual(Session(self.git, store, self.config).timeline(), [])
+        self.assertEqual(startup["entries"][".env"]["state"], "excluded")
+
+    def test_branch_first_snapshot_compares_carried_work_with_its_saved_head(self):
+        self.write("a.txt", b"carried work")
+        previous = self.core.capture()
+        self.git.run("switch", "-c", "feature/carried")
+        first = self.core.capture()
+        session = Session(self.git, self.store, self.config)
+        self.assertEqual(first["previousSnapshotId"], previous["id"])
+        changes = session.snapshot_changes(first["id"])
+        self.assertEqual([(c["path"], c["kind"]) for c in changes], [("a.txt", "modified")])
+        self.assertEqual(session.timeline()[0]["changedFiles"], len(changes))
+        diff = session.diff({"snapshotId": first["id"], "path": "a.txt"})
+        self.assertEqual(diff["left"], "baseline\r\n")
+        self.assertEqual(diff["right"], "carried work")
+        self.write("a.txt", b"next work")
+        following = self.core.capture()
+        self.assertEqual(session.diff({"snapshotId": following["id"], "path": "a.txt"})["left"], "carried work")
+
+    def test_branch_first_snapshot_uses_destination_head_and_survives_gc_offline(self):
+        self.git.run("switch", "-c", "feature/different-head")
+        self.write("a.txt", b"feature baseline")
+        self.git.add(["a.txt"])
+        self.git.run("commit", "-m", "feature baseline")
+        self.git.run("switch", "main")
+        self.write("b.txt", b"carried local work")
+        self.core.capture()
+        self.git.run("switch", "feature/different-head")
+        self.write("a.txt", b"carried local work")
+        first = self.core.capture()
+        self.assertEqual(first["summary"], "a.txt·b.txt 수정")
+        # This HEAD version has never been captured as worktree content.
+        baseline_hash = first["initialBefore"]["a.txt"]["hash"]
+        self.store.gc()
+        self.assertEqual(self.store.get(baseline_hash), b"feature baseline")
+        self.write("a.txt", b"feature baseline")
+        self.git.run("switch", "main")
+        reader = Store(self.store.directory, self.identity, readonly=True)
+        self.addCleanup(reader.close)
+        session = Session(self.git, reader, self.config, git_enabled=False)
+        with patch.object(self.git, "run", side_effect=AssertionError("Stored comparisons must not run Git")):
+            diff = session.diff({"snapshotId": first["id"], "path": "a.txt"})
+        self.assertEqual(diff["left"], "feature baseline")
+        self.assertEqual(diff["right"], "carried local work")
+        self.assertFalse(next(s for s in session.timeline() if s["id"] == first["id"])["comparisonPruned"])
+        self.core.capture()  # A new main epoch releases the feature epoch's protection.
+        self.store.delete_snapshot(first["id"])
+        self.store.gc()
+        self.assertFalse(self.store._object(baseline_hash).exists(), "Deleting the owning snapshot must release its baseline")
+
+    def test_branch_first_snapshot_shows_carried_additions_deletions_and_renames(self):
+        (self.root / "a.txt").rename(self.root / "renamed.txt")
+        (self.root / "b.txt").unlink()
+        self.write("new.txt", b"new local file")
+        self.core.capture()
+        self.git.run("switch", "-c", "feature/files")
+        first = self.core.capture()
+        session = Session(self.git, self.store, self.config)
+        changes = session.snapshot_changes(first["id"])
+        self.assertEqual({c["path"]: c["kind"] for c in changes}, {
+            "a.txt": "deleted", "b.txt": "deleted", "new.txt": "added", "renamed.txt": "added"})
+        self.assertEqual(session.timeline()[0]["changedFiles"], len(changes))
+        removed = session.diff({"snapshotId": first["id"], "path": "a.txt"})
+        self.assertEqual(removed["left"], "baseline\r\n")
+        self.assertTrue(removed["rightAbsent"])
+        added = session.diff({"snapshotId": first["id"], "path": "new.txt"})
+        self.assertTrue(added["leftAbsent"])
+        self.assertEqual(added["right"], "new local file")
+
+    def test_legacy_branch_first_snapshot_uses_recorded_head_without_rewriting_history(self):
+        self.write("a.txt", b"carried work")
+        self.core.capture()
+        self.git.run("switch", "-c", "feature/legacy")
+        first = self.core.capture()
+        first.pop("initialBefore")
+        first["summaryVersion"] = 2
+        path = self.store.record("snapshots", first["id"])
+        write_json(path, first)
+        original = path.read_bytes()
+        self.git.add(["a.txt"])
+        self.git.run("commit", "-m", "advance after capture")
+        session = Session(self.git, self.store, self.config)
+        diff = session.diff({"snapshotId": first["id"], "path": "a.txt"})
+        self.assertEqual(diff["left"], "baseline\r\n")
+        self.assertEqual(diff["right"], "carried work")
+        self.assertEqual(path.read_bytes(), original)
+        session.git_enabled = False
+        with patch.object(self.git, "run", side_effect=AssertionError("Git is disabled")):
+            self.assertTrue(any(s["id"] == first["id"] for s in session.timeline()))
+        with self.assertRaisesRegex(SafetyError, "Enable Git"):
+            session.snapshot_changes(first["id"])
+
+    def test_branch_first_snapshot_does_not_count_index_only_changes_as_disk_changes(self):
+        self.write("a.txt", b"staged work")
+        self.git.add(["a.txt"])
+        self.write("a.txt", b"baseline\r\n")
+        self.git.run("switch", "-c", "feature/index-only")
+        index = self.git.index_bytes()
+        first = self.core.capture()
+        self.assertEqual(first["initialChanges"], [])
+        self.assertEqual(first["changedFiles"], 0)
+        self.assertEqual(Session(self.git, self.store, self.config).snapshot_changes(first["id"]), [])
+        self.assertEqual(self.git.index_bytes(), index)
+
+    def test_legacy_clean_baseline_is_hidden_without_rewriting_or_losing_pins(self):
+        legacy = dict(self.initial)
+        legacy.pop("initialChanges")
+        legacy.pop("initialBefore")
+        legacy["changedFiles"] = 2
+        path = self.store.record("snapshots", legacy["id"])
+        write_json(path, legacy)
+        original = path.read_bytes()
+        session = Session(self.git, self.store, self.config)
+        self.assertEqual(session.timeline(), [])
+        reader = Store(self.store.directory, self.identity, readonly=True)
+        self.addCleanup(reader.close)
+        self.assertEqual(Session(self.git, reader, self.config).timeline(), [])
+        self.store.update_metadata(legacy["id"], pinned=True)
+        self.assertEqual(session.timeline()[0]["id"], legacy["id"])
+        self.store.update_metadata(legacy["id"], pinned=False, title="보존한 기준")
+        self.assertEqual(session.timeline()[0]["metadata"]["title"], "보존한 기준")
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_legacy_existing_work_remains_visible_using_recorded_startup_status(self):
+        self.write("a.txt", b"existing work")
+        store = Store(self.base / "legacy-dirty-start", self.identity)
+        self.addCleanup(store.close)
+        startup = SnapshotService(self.git, store, self.config).capture()
+        startup.pop("initialChanges")
+        startup.pop("initialBefore")
+        startup["changedFiles"] = 2
+        write_json(store.record("snapshots", startup["id"]), startup)
+        self.git.run("checkout", "--", "a.txt")  # Classification uses startup evidence, not today's clean tree.
+        timeline = Session(self.git, store, self.config).timeline()
+        self.assertEqual(timeline[0]["id"], startup["id"])
+        self.assertEqual(timeline[0]["changedFiles"], 1)
+
+    def test_clean_epoch_baselines_do_not_consume_normal_snapshot_count(self):
+        for number in range(2):
+            self.git.run("commit", "--allow-empty", "-m", f"external {number}")
+            baseline = self.core.capture()
+            self.assertEqual(baseline["initialChanges"], [])
+        self.write("a.txt", b"first work")
+        first = self.core.capture()
+        self.write("a.txt", b"second work")
+        second = self.core.capture()
+        self.store.prune({**self.config, "maxSnapshots": 2})
+        self.assertEqual({s["id"] for s in Session(self.git, self.store, self.config).timeline()}, {first["id"], second["id"]})
+        self.store.snapshot(first["id"], verify=True)
+        self.store.snapshot(baseline["id"], verify=True)
+
     def test_creation_deletion_and_rename_are_restorable(self):
         (self.root / "a.txt").rename(self.root / "renamed.txt")
         (self.root / "b.txt").unlink()
@@ -210,6 +410,161 @@ class CoreTests(unittest.TestCase):
         restore.apply(plan["id"], kind="undo", undoes=original)
         self.assertEqual((self.root / "a.txt").read_bytes(), b"work")
         self.assertEqual((self.root / "newer.txt").read_bytes(), b"keep")
+
+    def test_restore_rechecks_after_loading_replacement_bytes(self):
+        self.write("a.txt", b"reviewed work")
+        restore = RestoreService(self.core)
+        plan = restore.prepare(self.initial["id"])
+        original_write, original_get = restore.files.write, self.store.get
+        changed = False
+        def write_with_race(*args):
+            def read_then_change(object_hash, size=None):
+                nonlocal changed
+                data = original_get(object_hash, size)
+                if not changed:
+                    changed = True
+                    self.write("a.txt", b"external during object read")
+                return data
+            with patch.object(self.store, "get", side_effect=read_then_change):
+                return original_write(*args)
+        with patch.object(restore.files, "write", side_effect=write_with_race):
+            with self.assertRaises(SafetyError):
+                restore.apply(plan["id"])
+        self.assertEqual((self.root / "a.txt").read_bytes(), b"external during object read")
+
+    def test_restore_preserves_actual_file_changed_after_last_comparison(self):
+        self.write("a.txt", b"reviewed work")
+        def fault(phase, name):
+            if phase == "beforeDisplace":
+                self.write(name, b"external in final race window")
+        restore = RestoreService(self.core, fault=fault)
+        plan = restore.prepare(self.initial["id"])
+        with self.assertRaises(SafetyError):
+            restore.apply(plan["id"])
+        journal = self.store.journals()[0]
+        self.assertEqual(journal["phase"], "recoveryRequired")
+        self.assertEqual((self.root / "a.txt").read_bytes(), b"external in final race window")
+        preserved = restore.files.directory(journal["fileMoves"][0])
+        self.assertEqual((preserved / "original").read_bytes(), b"external in final race window")
+        self.assertFalse(any(".dev-snapshot-" in name for name in self.git.files()), "Recovery contents must remain Git-ignored")
+        engine, session = Engine(), Session(self.git, self.store, self.config)
+        engine.sessions[self.identity["id"]] = session
+        self.addCleanup(engine.close)
+        params = {"repositoryId": self.identity["id"], "operationId": journal["id"]}
+        report = engine.call("recoveryReport", params)
+        self.assertEqual(report["preservedFiles"], [{"path": "a.txt", "directory": restore.files.relative_directory(journal["fileMoves"][0])}])
+        destination = self.base / "export"
+        destination.mkdir()
+        with self.assertRaisesRegex(SafetyError, "selected recovery backup"):
+            engine.call("exportBackup", {**params, "snapshotId": self.initial["id"], "destination": str(destination), "approved": True})
+        self.assertEqual(list(destination.iterdir()), [], "Invalid backup selection must not write an export")
+        export = Path(engine.call("exportBackup", {**params, "snapshotId": plan["backupId"], "destination": str(destination), "approved": True}))
+        self.assertIn(b"external in final race window", [p.read_bytes() for p in export.rglob("original")])
+        self.assertIn(b"external in final race window", [p.read_bytes() for p in export.rglob("current")])
+        self.assertTrue(list(export.rglob("manifest.json")))
+        self.assertEqual((export / "a.txt").read_bytes(), b"reviewed work")
+        self.store.snapshot(plan["backupId"], verify=True)
+
+    def test_restore_never_overwrites_a_file_created_in_the_publication_gap(self):
+        self.write("a.txt", b"reviewed work")
+        def fault(phase, name):
+            if phase == "afterDisplace":
+                self.write(name, b"new external file")
+        restore = RestoreService(self.core, fault=fault)
+        plan = restore.prepare(self.initial["id"])
+        with self.assertRaises(SafetyError):
+            restore.apply(plan["id"])
+        self.assertEqual((self.root / "a.txt").read_bytes(), b"new external file")
+        journal = self.store.journals()[0]
+        self.assertEqual(journal["phase"], "recoveryRequired")
+        self.assertEqual((restore.files.directory(journal["fileMoves"][0]) / "original").read_bytes(), b"reviewed work")
+
+    def test_restore_creation_never_overwrites_a_racing_creator(self):
+        (self.root / "a.txt").unlink()
+        self.core.capture()
+        def fault(phase, name):
+            if phase == "afterDisplace":
+                self.write(name, b"external creation")
+        restore = RestoreService(self.core, fault=fault)
+        with self.assertRaises(SafetyError):
+            restore.apply(restore.prepare(self.initial["id"])["id"])
+        self.assertEqual((self.root / "a.txt").read_bytes(), b"external creation")
+
+    def test_restore_deletion_preserves_a_racing_modification(self):
+        self.write("remove.txt", b"reviewed deletion")
+        self.core.capture()
+        def fault(phase, name):
+            if phase == "beforeDisplace" and name == "remove.txt":
+                self.write(name, b"external before deletion")
+        restore = RestoreService(self.core, fault=fault)
+        with self.assertRaises(SafetyError):
+            restore.apply(restore.prepare(self.initial["id"])["id"])
+        self.assertEqual((self.root / "remove.txt").read_bytes(), b"external before deletion")
+
+    def test_restore_preserves_writes_to_a_displaced_inode(self):
+        self.write("a.txt", b"reviewed work")
+        def fault(phase, name):
+            if phase == "afterPublish":
+                journal = self.store.journals()[0]
+                directory = restore.files.directory(journal["fileMoves"][-1])
+                (directory / "original").write_bytes(b"late write through an old handle")
+        restore = RestoreService(self.core, fault=fault)
+        with self.assertRaises(SafetyError):
+            restore.apply(restore.prepare(self.initial["id"])["id"])
+        journal = self.store.journals()[0]
+        self.assertEqual(journal["phase"], "recoveryRequired")
+        directory = restore.files.directory(journal["fileMoves"][0])
+        self.assertEqual((directory / "original").read_bytes(), b"late write through an old handle")
+
+    def test_restore_without_safe_publication_support_leaves_original_untouched(self):
+        self.write("a.txt", b"keep this work")
+        restore = RestoreService(self.core)
+        plan = restore.prepare(self.initial["id"])
+        with patch("dev_snapshot.restore_io.os.link", side_effect=OSError("unsupported")):
+            with self.assertRaisesRegex(SafetyError, "hard-link support"):
+                restore.apply(plan["id"])
+        self.assertEqual((self.root / "a.txt").read_bytes(), b"keep this work")
+        self.assertEqual(self.store.journals()[0]["phase"], "rolledBack")
+        self.assertFalse(list(self.root.glob(".dev-snapshot-*.restore")))
+
+    def test_restore_preserves_a_concurrent_edit_during_rollback(self):
+        self.write("a.txt", b"reviewed work")
+        displacements = 0
+        def fault(phase, name):
+            nonlocal displacements
+            if phase == "beforeDisplace":
+                displacements += 1
+                if displacements == 2:
+                    self.write(name, b"external during rollback")
+            if phase == "afterWrite":
+                raise RuntimeError("start rollback")
+        restore = RestoreService(self.core, fault=fault)
+        with self.assertRaises(RuntimeError):
+            restore.apply(restore.prepare(self.initial["id"])["id"])
+        self.assertEqual((self.root / "a.txt").read_bytes(), b"external during rollback")
+        journal = self.store.journals()[0]
+        self.assertEqual(journal["phase"], "recoveryRequired")
+        originals = [(restore.files.directory(move) / "original").read_bytes() for move in journal["fileMoves"]]
+        self.assertIn(b"reviewed work", originals)
+        self.assertIn(b"external during rollback", originals)
+
+    def test_restore_missing_path_recovery_respects_new_unsaved_edits(self):
+        self.write("a.txt", b"reviewed work")
+        dirty = set()
+        def fault(phase, name):
+            if phase == "afterDisplace":
+                dirty.add(name)
+        restore = RestoreService(self.core, dirty=lambda: dirty, fault=fault)
+        with self.assertRaisesRegex(SafetyError, "unsaved edits"):
+            restore.apply(restore.prepare(self.initial["id"])["id"])
+        journal = self.store.journals()[0]
+        self.assertEqual(journal["phase"], "recoveryRequired")
+        self.assertFalse((self.root / "a.txt").exists(), "Recovery must respect unsaved-document guards")
+        self.assertEqual((restore.files.directory(journal["fileMoves"][0]) / "original").read_bytes(), b"reviewed work")
+        dirty.clear()
+        restore.rollback(journal)
+        self.assertEqual((self.root / "a.txt").read_bytes(), b"reviewed work")
+        self.assertEqual(journal["phase"], "rolledBack")
 
     def test_branch_change_blocks_reviewed_restore(self):
         self.write("a.txt", b"work")
@@ -398,7 +753,15 @@ class CoreTests(unittest.TestCase):
         store = Store(self.base / "empty-store", identity)
         self.addCleanup(store.close)
         core = SnapshotService(git, store, settings_from(None))
-        self.assertIsNone(core.capture()["context"]["head"])
+        initial = core.capture()
+        self.assertIsNone(initial["context"]["head"])
+        initial.pop("initialBefore")  # Older unborn-HEAD records need no Git baseline lookup.
+        write_json(store.record("snapshots", initial["id"]), initial)
+        offline = Session(git, store, settings_from(None), git_enabled=False)
+        with patch.object(git, "run", side_effect=AssertionError("Git is disabled")):
+            diff = offline.diff({"snapshotId": initial["id"], "path": "hello.py"})
+        self.assertTrue(diff["leftAbsent"])
+        self.assertEqual(diff["right"], "print('hello')\n")
         service = CommitService(core)
         journal = service.prepare(["hello.py"])
         self.assertFalse(journal["indexExisted"])
@@ -407,6 +770,15 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(service.execute(service.prepare(["hello.py"]), "feat: initial", [])["expected"])
 
     def test_process_crash_after_write_can_be_recovered_on_restart(self):
+        self.crash_restore_at("afterWrite")
+
+    def test_process_crash_after_displacement_recovers_the_missing_path(self):
+        self.crash_restore_at("afterDisplace")
+
+    def test_process_crash_after_publication_recovers_the_original_file(self):
+        self.crash_restore_at("afterPublish")
+
+    def crash_restore_at(self, phase):
         self.write("a.txt", b"recover me")
         storage = self.store.directory
         self.store.close()
@@ -423,12 +795,12 @@ from dev_snapshot.common import settings_from
 git = Git(Path(sys.argv[2])); store = Store(Path(sys.argv[3]), git.identity())
 core = SnapshotService(git, store, settings_from(None))
 def fault(phase, name):
-    if phase == 'afterWrite': os._exit(42)
+    if phase == sys.argv[5]: os._exit(42)
 service = RestoreService(core, fault=fault)
 service.apply(service.prepare(sys.argv[4])['id'])
 """
-        result = subprocess.run([sys.executable, "-I", "-S", "-c", code, backend, str(self.root), str(storage), self.initial["id"]], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        self.assertEqual(result.returncode, 42, result.stderr.decode())
+        result = subprocess.run([sys.executable, "-I", "-S", "-c", code, backend, str(self.root), str(storage), self.initial["id"], phase], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(result.returncode, 42, result.stderr.decode(errors="replace"))
         self.store = Store(storage, self.identity)
         self.core = SnapshotService(self.git, self.store, self.config)
         journal = self.store.journals()[0]
@@ -437,6 +809,7 @@ service.apply(service.prepare(sys.argv[4])['id'])
         service.rollback(journal)
         self.assertEqual((self.root / "a.txt").read_bytes(), b"recover me")
         self.assertEqual(journal["phase"], "rolledBack")
+        self.assertFalse(list(self.root.glob(".dev-snapshot-*.restore")))
 
     def test_path_validation_and_text_decoding(self):
         for name in ("../x", "/x", "a/../x", "a\\b", "a/.git/config", "C:/x", "a\0b"):
@@ -588,6 +961,116 @@ service.apply(service.prepare(sys.argv[4])['id'])
         self.assertEqual(before_disk, {p.name: p.read_bytes() for p in self.root.iterdir() if p.is_file()})
         with self.assertRaises(SafetyError):
             service.prepare_boundary(snapshots[1]["id"])
+
+    def test_boundary_selected_code_then_docs_from_same_snapshot_survive_restart(self):
+        self.write("a.txt", b"selected code")
+        self.write("guide.md", b"selected docs")
+        selected = self.core.capture()
+        self.write("a.txt", b"newer local code")
+        self.write("guide.md", b"newer local docs")
+        self.core.capture()
+        engine, session = Engine(), Session(self.git, self.store, self.config)
+        engine.sessions[self.identity["id"]] = session
+        self.addCleanup(engine.close)
+        params = {"repositoryId": self.identity["id"], "snapshotId": selected["id"]}
+        review = engine.call("commitBoundaryReview", {**params, "selected": ["a.txt"]})
+        self.assertEqual([c["path"] for c in review["omitted"]], ["guide.md"])
+        prepared = engine.call("commitPrepare", {**params, "selected": ["a.txt"], "reviewHash": review["reviewHash"], "approved": True})
+        self.assertEqual(prepared["selected"], ["a.txt"])
+        first = engine.call("commitExecute", {"repositoryId": self.identity["id"], "operationId": prepared["id"], "message": "feat: code only", "approved": True})
+        self.assertTrue(first["expected"])
+        self.assertTrue(first["partial"])
+        self.assertNotIn("cleanup", first, "Incomplete snapshots must not offer history cleanup")
+        self.assertEqual(self.git.file_content("a.txt", head=first["oid"]), b"selected code")
+        self.assertIsNone(self.git.file_content("guide.md", head=first["oid"]))
+        timeline = {s["id"]: s for s in session.timeline()}
+        self.assertEqual(timeline[selected["id"]]["boundaryState"], "partial")
+        self.assertEqual(timeline[selected["id"]]["commitChangedFiles"], 1)
+        # Reopen application state, then commit the remaining documentation at the same boundary.
+        session = Session(self.git, self.store, self.config)
+        engine.sessions[self.identity["id"]] = session
+        self.store.gc()
+        remaining = engine.call("commitBoundaryReview", params)
+        self.assertEqual([c["path"] for c in remaining["changes"]], ["guide.md"])
+        prepared = engine.call("commitPrepare", {**params, "selected": ["guide.md"], "reviewHash": remaining["reviewHash"], "approved": True})
+        second = engine.call("commitExecute", {"repositoryId": self.identity["id"], "operationId": prepared["id"], "message": "docs: guide", "approved": True})
+        self.assertTrue(second["expected"])
+        self.assertFalse(second.get("partial"))
+        self.assertIn("cleanup", second)
+        self.assertEqual(self.git.file_content("a.txt", head=second["oid"]), b"selected code")
+        self.assertEqual(self.git.file_content("guide.md", head=second["oid"]), b"selected docs")
+        self.assertEqual((self.root / "a.txt").read_bytes(), b"newer local code")
+        self.assertEqual((self.root / "guide.md").read_bytes(), b"newer local docs")
+        self.assertTrue(self.git.clean_index())
+        self.assertEqual(next(s for s in session.timeline() if s["id"] == selected["id"])["boundaryState"], "committed")
+
+    def test_boundary_selected_deletion_leaves_other_files_for_later_commit(self):
+        from dev_snapshot.boundary import BoundaryCommitService
+        (self.root / "a.txt").rename(self.root / "renamed.txt")
+        self.write("guide.md", b"docs later")
+        snapshot = self.core.capture()
+        service = BoundaryCommitService(self.core)
+        first = service.execute(service.prepare_boundary(snapshot["id"], selected=["a.txt"]), "chore: remove old path", [])
+        self.assertTrue(first["partial"])
+        self.assertIsNone(self.git.file_content("a.txt", head=first["oid"]))
+        self.assertIsNone(self.git.file_content("renamed.txt", head=first["oid"]))
+        self.assertEqual({c["path"] for c in service.review(snapshot["id"])["changes"]}, {"guide.md", "renamed.txt"})
+        final = service.execute(service.prepare_boundary(snapshot["id"]), "chore: remaining files", [])
+        self.assertTrue(final["expected"])
+        self.assertEqual(self.git.file_content("renamed.txt", head=final["oid"]), b"baseline\r\n")
+        self.assertEqual(self.git.file_content("guide.md", head=final["oid"]), b"docs later")
+
+    def test_boundary_selection_rejects_unavailable_empty_and_changed_reviews(self):
+        service, snapshots = self.boundary_fixture()
+        target = snapshots[1]["id"]
+        before = self.git.context(), self.git.index_bytes()
+        for selected in (["b.txt"], ["a.txt", "a.txt"], ["../outside"], "a.txt", []):
+            with self.assertRaises(SafetyError):
+                service.prepare_boundary(target, selected=selected)
+        review = service.review(target, selected=["a.txt"])
+        with self.assertRaisesRegex(SafetyError, "changed after review"):
+            service.prepare_boundary(target, selected=["a.txt"], review_hash="stale")
+        prepared = service.prepare_boundary(target, selected=["a.txt"], review_hash=review["reviewHash"])
+        service.cancel(prepared)
+        self.assertEqual((self.git.context(), self.git.index_bytes()), before)
+        self.assertEqual((self.root / "a.txt").read_bytes(), b"work 5")
+
+    def test_boundary_partial_filter_baselines_survive_gc_and_later_snapshots(self):
+        from dev_snapshot.boundary import BoundaryCommitService
+        self.write(".gitattributes", b"*.txt text eol=lf\n")
+        self.git.add([".gitattributes"])
+        self.git.run("commit", "-m", "configure line endings")
+        self.core.capture()
+        self.write("a.txt", b"first\r\ncode\r\n")
+        self.write("b.txt", b"second\r\n")  # A selected file with no change after Git normalization.
+        self.write("guide.md", b"docs pending")
+        first = self.core.capture()
+        service = BoundaryCommitService(self.core)
+        code = service.execute(service.prepare_boundary(first["id"], selected=["a.txt", "b.txt"]), "feat: first code", [])
+        self.assertEqual(self.git.file_content("a.txt", head=code["oid"]), b"first\ncode\n")
+        self.assertEqual([c["path"] for c in service.review(first["id"])["changes"]], ["guide.md"])
+        first_hash = first["entries"]["a.txt"]["hash"]
+        self.write("a.txt", b"second\r\ncode\r\n")
+        self.write("b.txt", b"another feature\r\n")
+        later = self.core.capture()
+        service.execute(service.prepare_boundary(later["id"], selected=["b.txt"]), "feat: b only", [])
+        self.store.delete_snapshot(first["id"])
+        # Remove completed-operation backups to leave only the partial receipt owning the old raw bytes.
+        for snapshot in self.store.snapshots():
+            if snapshot["reason"] == "backup":
+                self.store.update_metadata(snapshot["id"], protectedUntil="")
+                self.store.delete_snapshot(snapshot["id"])
+        self.store.gc()
+        self.assertEqual(self.store.get(first_hash), b"first\r\ncode\r\n")
+        service = BoundaryCommitService(self.core)
+        self.assertEqual({c["path"] for c in service.review(later["id"])["changes"]}, {"a.txt", "guide.md"})
+        service.execute(service.prepare_boundary(later["id"], selected=["a.txt"]), "feat: second code", [])
+        self.store.gc()
+        self.assertFalse(self.store._object(first_hash).exists(), "Superseded partial receipts must not leak old objects")
+        self.assertEqual([c["path"] for c in service.review(later["id"])["changes"]], ["guide.md"])
+        docs = service.execute(service.prepare_boundary(later["id"]), "docs: separate guide", [])
+        self.assertTrue(docs["expected"])
+        self.assertEqual(self.git.file_content("guide.md", head=docs["oid"]), b"docs pending")
 
     def test_boundary_cancel_leaves_real_git_state_untouched(self):
         service, snapshots = self.boundary_fixture()
@@ -834,10 +1317,12 @@ service.execute(journal, 'chore: crash boundary', [])
         self.assertEqual((self.git.context(), self.git.index_bytes()), before)
 
     def test_boundary_baseline_error_keeps_stored_timeline_readable(self):
+        self.write("a.txt", b"pending work")
+        selected = self.core.capture()
         session = Session(self.git, self.store, self.config)
         with patch.object(session.commits, "baseline", side_effect=SafetyError("Baseline unavailable")):
             timeline = session.timeline()
-            self.assertEqual(timeline[0]["id"], self.initial["id"])
+            self.assertEqual(timeline[0]["id"], selected["id"])
             self.assertEqual(timeline[0]["rangeError"], "Baseline unavailable")
             with self.assertRaises(SafetyError):
                 session.commits.review(self.initial["id"])
@@ -929,9 +1414,11 @@ service.execute(journal, 'chore: crash boundary', [])
             reader.update_metadata(selected["id"], title="must not write")
 
     def test_work_title_validation_and_clear_to_automatic_summary(self):
+        self.write("a.txt", b"pending work")
+        selected = self.core.capture()
         session, engine = Session(self.git, self.store, self.config), Engine()
         engine.sessions[self.identity["id"]] = session
-        params = {"repositoryId": self.identity["id"], "snapshotId": self.initial["id"]}
+        params = {"repositoryId": self.identity["id"], "snapshotId": selected["id"]}
         for invalid in ("a\nb", "x" * 101, None):
             with self.assertRaises(SafetyError):
                 engine.call("renameSnapshot", {**params, "title": invalid})
@@ -950,6 +1437,79 @@ service.execute(journal, 'chore: crash boundary', [])
         session = Session(self.git, self.store, self.config)
         self.assertEqual(session.timeline()[0]["summary"], "timeline.ts 추가")
         self.assertEqual(self.store.record("snapshots", selected["id"]).read_bytes(), original)
+
+    def snapshot_delete_fixture(self):
+        self.write("a.txt", b"older work")
+        older = self.core.capture()
+        self.write("a.txt", b"selected work")
+        selected = self.core.capture()
+        self.write("a.txt", b"latest work")
+        latest = self.core.capture()
+        engine = Engine()
+        session = Session(self.git, self.store, self.config)
+        engine.sessions[self.identity["id"]] = session
+        self.addCleanup(engine.close)
+        return engine, session, {"repositoryId": self.identity["id"]}, older, selected, latest
+
+    def test_usage_identifies_saved_branches_custom_titles_internal_baselines_and_backups(self):
+        engine, session, params, older, selected, latest = self.snapshot_delete_fixture()
+        self.store.update_metadata(selected["id"], title="삭제 확인용 작업")
+        self.git.run("switch", "-c", "feature/history")
+        switched = self.core.capture()
+        backup = self.core.backup(switched["entries"], switched["context"])
+        original = {s["id"]: self.store.record("snapshots", s["id"]).read_bytes() for s in self.store.snapshots()}
+        records = {s["id"]: s for s in engine.call("usage", params)["snapshots"]}
+        self.assertEqual(records[selected["id"]]["title"], "삭제 확인용 작업")
+        self.assertEqual(records[selected["id"]]["context"]["branch"], "refs/heads/main")
+        self.assertEqual(records[switched["id"]]["context"]["branch"], "refs/heads/feature/history")
+        self.assertEqual(records[self.initial["id"]]["title"], "이전 내부 비교 기준")
+        self.assertEqual(records[backup["id"]]["title"], "복구 백업")
+        self.assertTrue(records[backup["id"]]["protected"])
+        for record_id, contents in original.items():
+            self.assertEqual(self.store.record("snapshots", record_id).read_bytes(), contents)
+
+    def test_single_delete_requires_approval_and_preserves_other_snapshots_git_and_files(self):
+        engine, session, params, older, selected, latest = self.snapshot_delete_fixture()
+        with self.assertRaises(SafetyError):
+            engine.call("deleteSnapshot", {**params, "snapshotId": selected["id"]})
+        self.store.snapshot(selected["id"], verify=True)
+        context, index = self.git.context(), self.git.index_bytes()
+        engine.call("deleteSnapshot", {**params, "snapshotId": selected["id"], "approved": True})
+        with self.assertRaises(FileNotFoundError):
+            self.store.snapshot(selected["id"])
+        for snapshot in (self.initial, older, latest):
+            self.store.snapshot(snapshot["id"], verify=True)
+        self.assertFalse(self.store._object(selected["entries"]["a.txt"]["hash"]).exists())
+        timeline = {s["id"]: s for s in session.timeline()}
+        self.assertTrue(timeline[latest["id"]]["comparisonPruned"])
+        self.assertTrue(session.snapshot_changes(latest["id"]))
+        self.assertEqual(self.git.context(), context)
+        self.assertEqual(self.git.index_bytes(), index)
+        self.assertEqual((self.root / "a.txt").read_bytes(), b"latest work")
+        restore = RestoreService(self.core)
+        restore.apply(restore.prepare(older["id"])["id"])
+        self.assertEqual((self.root / "a.txt").read_bytes(), b"older work")
+
+    def test_single_delete_rechecks_protection_and_preserves_latest_initial_pins_and_backups(self):
+        engine, session, params, older, selected, latest = self.snapshot_delete_fixture()
+        review = engine.call("usage", params)
+        self.assertFalse(next(s for s in review["snapshots"] if s["id"] == selected["id"])["protected"])
+        self.store.update_metadata(selected["id"], pinned=True)
+        backup = self.core.backup(latest["entries"], latest["context"])
+        for snapshot in (selected, latest, self.initial, backup):
+            with self.assertRaises(SafetyError):
+                engine.call("deleteSnapshot", {**params, "snapshotId": snapshot["id"], "approved": True})
+            self.store.snapshot(snapshot["id"], verify=True)
+
+    def test_single_delete_preserves_latest_committed_boundary(self):
+        engine, session, params, older, selected, latest = self.snapshot_delete_fixture()
+        journal = engine.call("commitPrepare", {**params, "snapshotId": selected["id"], "approved": True})
+        receipt = engine.call("commitExecute", {**params, "operationId": journal["id"], "message": "chore: boundary",
+                                               "snapshotIds": [selected["id"]], "approved": True})
+        self.assertTrue(receipt["expected"])
+        with self.assertRaises(SafetyError):
+            engine.call("deleteSnapshot", {**params, "snapshotId": selected["id"], "approved": True})
+        self.store.snapshot(selected["id"], verify=True)
 
     def history_fixture(self):
         self.write("a.txt", b"older work")
@@ -995,6 +1555,51 @@ service.execute(journal, 'chore: crash boundary', [])
         with self.assertRaises(SafetyError):
             engine.call("historyDelete", {**params, "token": token, "approved": True})
         self.store.snapshot(older["id"], verify=True)
+
+    def test_commit_cleanup_preserves_other_branches_uncommitted_snapshots(self):
+        self.git.run("switch", "-c", "feature/uncommitted")
+        self.write("a.txt", b"feature work only in history")
+        feature = self.core.capture()
+        self.write("a.txt", b"baseline\r\n")
+        self.git.run("switch", "main")
+        self.core.capture()
+        self.write("a.txt", b"older main work")
+        older = self.core.capture()
+        self.write("a.txt", b"main selected")
+        selected = self.core.capture()
+        engine, session = Engine(), Session(self.git, self.store, self.config)
+        engine.sessions[self.identity["id"]] = session
+        self.addCleanup(engine.close)
+        params = {"repositoryId": self.identity["id"]}
+        journal = engine.call("commitPrepare", {**params, "snapshotId": selected["id"], "approved": True})
+        receipt = engine.call("commitExecute", {**params, "operationId": journal["id"], "message": "chore: main only", "snapshotIds": [selected["id"]], "approved": True})
+        review = receipt["cleanup"]
+        self.assertEqual(review["branch"], "refs/heads/main")
+        self.assertTrue(all(s["branch"] == "refs/heads/main" for s in review["candidates"]))
+        self.assertNotIn(feature["id"], {s["id"] for s in review["candidates"]})
+        self.assertIn(older["id"], {s["id"] for s in review["candidates"]})
+        engine.call("historyDelete", {**params, "token": review["token"], "approved": True})
+        self.store.snapshot(feature["id"], verify=True)
+        self.assertEqual(self.store.get(feature["entries"]["a.txt"]["hash"]), b"feature work only in history")
+        with self.assertRaises(FileNotFoundError):
+            self.store.snapshot(older["id"])
+
+    def test_cleanup_review_cannot_be_changed_to_another_branch(self):
+        engine, session, params, older, selected, later, receipt = self.history_fixture()
+        review = dict(receipt["cleanup"])
+        review.pop("token")
+        review["branch"] = "refs/heads/other"
+        with self.assertRaises(SafetyError):
+            self.store.delete_history_before(review)
+        self.store.snapshot(older["id"], verify=True)
+
+    def test_history_cleanup_blocks_detached_head_boundaries(self):
+        self.git.run("switch", "--detach", "HEAD")
+        self.write("a.txt", b"detached work")
+        selected = self.core.capture()
+        with self.assertRaisesRegex(SafetyError, "attached branch"):
+            self.store.history_before(selected["id"])
+        self.store.snapshot(self.initial["id"], verify=True)
 
     def test_commit_cleanup_rechecks_new_pins_before_any_deletion(self):
         engine, session, params, older, selected, later, receipt = self.history_fixture()

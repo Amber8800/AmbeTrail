@@ -31,8 +31,9 @@ def display_bytes(data: bytes | None) -> str:
 
 
 class Session:
-    def __init__(self, git: Git, store: Store, config: dict):
+    def __init__(self, git: Git, store: Store, config: dict, *, git_enabled: bool = True):
         self.git, self.store = git, store
+        self.git_enabled = git_enabled
         self.core = SnapshotService(git, store, config)
         self.dirty: set[str] = set()
         self.restore = RestoreService(self.core, lambda: self.dirty)
@@ -154,9 +155,10 @@ class Session:
     def summary(self) -> dict:
         snapshots = self.store.snapshots()
         latest = next((s for s in snapshots if s["reason"] != "backup"), None)
+        latest_visible = next((s for s in snapshots if s["reason"] != "backup" and not self.store.is_internal_baseline(s)), None)
         return {"id": self.store.identity["id"], "root": str(self.git.root), "writable": self.store.writable,
                 "paused": self.paused, "status": self.message, "dirtyCount": len(self.dirty),
-                "latestAt": latest["endedAt"] if latest else None,
+                "latestAt": latest_visible["endedAt"] if latest_visible else None,
                 "branch": latest["context"]["branch"] if latest else None,
                 "excludedCount": latest.get("excludedCount", 0) if latest else 0,
                 "job": dict(self.job) if self.job else None,
@@ -168,7 +170,7 @@ class Session:
         self.work_summaries = {k: v for k, v in self.work_summaries.items() if k[0] in indexed}
         self.interval_summaries = {k: v for k, v in self.interval_summaries.items() if k[0] in indexed}
         context, anchor, baseline, range_error = None, None, None, None
-        if self.store.writable and not (self.worker and self.worker.is_alive()) and not any(unfinished(j) for j in self.store.journals()):
+        if self.git_enabled and self.store.writable and not (self.worker and self.worker.is_alive()) and not any(unfinished(j) for j in self.store.journals()):
             try:
                 context = self.git.context()
                 if not context["busy"] and not context["sparse"] and context["branch"]:
@@ -178,23 +180,27 @@ class Session:
                 range_error = str(error) if isinstance(error, SafetyError) else "Git baseline could not be read. Stored history remains available."
                 context, anchor, baseline = None, None, None
         result = []
-        for s in snapshots[:max(1, min(limit, 1000))]:
+        visible = [s for s in snapshots if not self.store.is_internal_baseline(s)]
+        for s in visible[:max(1, min(limit, 1000))]:
             previous = indexed.get(s["previousSnapshotId"], {})
-            comparison_pruned = bool(s["previousSnapshotId"] and not previous)
+            comparison_pruned = bool(s["reason"] != "initial" and s["previousSnapshotId"] and not previous)
             summary = s.get("summary", "저장된 파일 상태")
             changed_files = s.get("changedFiles", 0)
+            initial_paths = self.store.initial_changed_paths(s)
+            if initial_paths is not None:
+                changed_files = len(initial_paths)
             commit_summary, commit_changed_files = None, None
             boundary_state = "unavailable"
-            if s.get("summaryVersion") != 3 and not comparison_pruned:
+            if s.get("summaryVersion") != 3 and not comparison_pruned and (self.git_enabled or s["reason"] != "initial"):
                 key = (s["id"], comparison_pruned)
                 if key not in self.work_summaries:
                     self.work_summaries[key] = snapshot_summary(self.snapshot_changes(s["id"]))
                 summary = self.work_summaries[key]
             if baseline is not None and s["context"]["branch"] == context["branch"]:
-                if anchor and s["endedAt"] <= anchor["boundaryAt"]:
+                if anchor and (s["endedAt"] < anchor["boundaryAt"] or s["endedAt"] == anchor["boundaryAt"] and not anchor.get("partial")):
                     boundary_state = "committed"
                 elif s["context"]["head"] in ([context["head"]] + (anchor["sourceHeads"] if anchor else [])):
-                    boundary_state = "ready"
+                    boundary_state = "partial" if anchor and anchor.get("partial") and s["id"] == anchor["snapshotIds"][0] else "ready"
                     key = (s["id"], context["head"])
                     if key not in self.interval_summaries:
                         changes = changes_between(baseline, self.store.snapshot(s["id"])["entries"])
@@ -210,12 +216,22 @@ class Session:
     def snapshot_changes(self, snapshot_id: str) -> list[dict]:
         snapshot = self.store.snapshot(snapshot_id)
         before = {}
-        if snapshot["previousSnapshotId"]:
+        initial_paths = self.store.initial_changed_paths(snapshot)
+        if snapshot["reason"] == "initial":
+            if "initialBefore" in snapshot:
+                before = snapshot["initialBefore"]
+            else:
+                if not self.git_enabled and snapshot["context"]["head"]:
+                    raise SafetyError("Enable Git to compare this older initial snapshot with its recorded HEAD.")
+                paths = initial_paths if initial_paths is not None else [p for p, e in snapshot["entries"].items() if e["state"] != "excluded"]
+                before = self.core.head_entries(snapshot["context"]["head"], paths, persist=False)
+        elif snapshot["previousSnapshotId"]:
             try:
                 before = self.store.snapshot(snapshot["previousSnapshotId"])["entries"]
             except FileNotFoundError:
                 pass
-        return changes_between(before, snapshot["entries"])
+        after = snapshot["entries"] if initial_paths is None else {p: snapshot["entries"][p] for p in initial_paths}
+        return changes_between(before, after)
 
     def entry_content(self, entry: dict) -> bytes | None:
         return self.store.get(entry["hash"], entry["size"]) if entry["state"] == "present" else None
@@ -227,7 +243,11 @@ class Session:
             change = next((c for c in self.snapshot_changes(params["snapshotId"]) if c["path"] == name), None)
             if not change:
                 raise SafetyError("This file is not a change in the selected snapshot.")
-            before, after = self.entry_content(change["before"]), self.entry_content(change["after"])
+            snapshot = self.store.snapshot(params["snapshotId"])
+            before = (self.git.file_content(name, head=snapshot["context"]["head"])
+                      if snapshot["reason"] == "initial" and "initialBefore" not in snapshot
+                      else self.entry_content(change["before"]))
+            after = self.entry_content(change["after"])
         elif kind == "restore":
             plan = self.restore.plans.get(params["planId"])
             if not plan:
@@ -239,6 +259,13 @@ class Session:
         elif kind == "boundaryStaged":
             journal = Engine._journal(self, params["operationId"])
             before, after = self.commits.diff(journal, name)
+        elif kind == "boundary":
+            review = self.commits.review(params["snapshotId"])
+            change = next((c for c in review["changes"] if c["path"] == name), None)
+            if not change:
+                raise SafetyError("File is outside the current snapshot commit scope.")
+            before = self.git.file_content(name, head=review["context"]["head"])
+            after = self.entry_content(change["after"])
         elif kind in ("current", "staged"):
             if Policy(self.core).exclusion(name):
                 raise SafetyError("Excluded files cannot be previewed.")
@@ -291,7 +318,7 @@ class Engine:
 
     def call(self, method: str, params: dict) -> object:
         if method == "hello":
-            return {"protocol": 1, "version": "0.1.3", "python": os.sys.version.split()[0]}
+            return {"protocol": 1, "version": "0.2.1", "python": os.sys.version.split()[0]}
         if method == "open":
             config = settings_from(params.get("settings"))
             git = Git(Path(params["root"]).resolve(strict=True), params.get("gitPath", "git"))
@@ -321,7 +348,7 @@ class Engine:
                 if not any(root == r or r.is_relative_to(root) for r in roots):
                     continue
                 store = Store(directory, identity, readonly=True)
-                session = Session(Git(root), store, settings_from(None))
+                session = Session(Git(root), store, settings_from(None), git_enabled=False)
                 session.message = "Git 비활성 · 과거 기록 조회 전용"
                 self.sessions[identity["id"]] = session
             return [s.summary() for s in self.sessions.values()]
@@ -405,14 +432,14 @@ class Engine:
         elif method == "commitChoices":
             return session.commits.choices()
         elif method == "commitBoundaryReview":
-            return session.commits.review(params["snapshotId"])
+            return session.commits.review(params["snapshotId"], selected=params.get("selected"))
         elif method == "commitPrepare":
             self._approved(params)
-            result = session.commits.prepare_boundary(params["snapshotId"]) if params.get("snapshotId") else session.commits.prepare(params["selected"])
+            result = session.commits.prepare_boundary(params["snapshotId"], selected=params.get("selected"), review_hash=params.get("reviewHash")) if params.get("snapshotId") else session.commits.prepare(params["selected"])
         elif method == "commitExecute":
             self._approved(params)
             result = session.commits.execute(self._journal(session, params["operationId"]), params["message"], params.get("snapshotIds", []))
-            if result["expected"] and result["snapshotIds"]:
+            if result["expected"] and result["snapshotIds"] and not result.get("partial"):
                 try:
                     review = store.history_before(result["snapshotIds"][0])
                     token = new_id()
@@ -456,8 +483,15 @@ class Engine:
             result = store.update_metadata(params["snapshotId"], pinned=not store.metadata(params["snapshotId"])["pinned"])
         elif method == "usage":
             protected = store.protected_ids()
+            snapshots = []
+            for s in store.snapshots():
+                internal = store.is_internal_baseline(s)
+                fallback_title = "이전 내부 비교 기준" if internal else "기존 미커밋 작업" if s["reason"] == "initial" else s.get("summary", "복구 백업" if s["reason"] == "backup" else "저장된 파일 상태")
+                snapshots.append({"id": s["id"], "endedAt": s["endedAt"], "reason": s["reason"],
+                                  "internalBaseline": internal, "protected": s["id"] in protected,
+                                  "title": store.metadata(s["id"]).get("title") or fallback_title, "context": s["context"]})
             return {"bytes": store.usage(), "limit": session.core.config["maxStorageMiB"] * 1024 * 1024,
-                    "snapshots": [{"id": s["id"], "endedAt": s["endedAt"], "reason": s["reason"], "protected": s["id"] in protected} for s in store.snapshots()]}
+                    "snapshots": snapshots}
         elif method == "prune":
             result = store.prune(session.core.config)
         elif method == "deleteSnapshot":
@@ -467,7 +501,7 @@ class Engine:
         elif method == "recoveryReport":
             journal = self._journal(session, params["operationId"])
             return {"journal": journal, "files": session.restore.report(journal) if journal["kind"] != "commit" else [],
-                    "currentContext": session.git.context()}
+                    "currentContext": session.git.context(), "preservedFiles": session.restore.files.preserved(journal)}
         elif method == "recover":
             self._approved(params, writers=True)
             journal = self._journal(session, params["operationId"])
@@ -485,6 +519,9 @@ class Engine:
         elif method == "exportBackup":
             self._approved(params)
             snapshot = store.snapshot(params["snapshotId"], verify=True)
+            journal = self._journal(session, params["operationId"]) if params.get("operationId") else None
+            if journal and journal["backupId"] != snapshot["id"]:
+                raise SafetyError("Preserved files must belong to the selected recovery backup.")
             destination = Path(params["destination"]).resolve(strict=True)
             if destination.is_relative_to(session.git.root) or destination.is_relative_to(store.directory):
                 raise SafetyError("Choose an export directory outside the working repository and snapshot storage.")
@@ -493,6 +530,8 @@ class Engine:
             for name, entry in snapshot["entries"].items():
                 if entry["state"] == "present":
                     atomic_write(safe_path(export, name), store.get(entry["hash"], entry["size"]), 0o700 if entry["executable"] else 0o600)
+            if journal:
+                session.restore.files.export(journal, export)
             result = str(export)
         else:
             raise SafetyError("Unknown engine method.")

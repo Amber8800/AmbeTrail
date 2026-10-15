@@ -6,7 +6,7 @@ import shutil
 from pathlib import Path
 
 from .common import (ABSENT, SafetyError, atomic_write, digest, fsync_directory,
-                     is_link, native_path, new_id, read_json, safe_path, sha, utc_now, validate_id)
+                     is_link, native_path, new_id, read_json, relative_path, safe_path, sha, utc_now, validate_entries, validate_id)
 from .commits import CommitService
 from .git import Git, same_context
 from .restore import unfinished
@@ -27,6 +27,10 @@ class BoundaryCommitService(CommitService):
 
     def baseline(self, context: dict, anchor: dict | None) -> dict:
         if anchor:
+            if anchor.get("partial"):
+                entries = dict(self.baseline(context, None))
+                entries.update(validate_entries(anchor["committedEntries"]))
+                return entries
             return self.core.store.snapshot(anchor["snapshotIds"][0])["entries"]
         key = (context["head"], digest(self.core.config))
         if key in self.baselines:
@@ -69,7 +73,7 @@ class BoundaryCommitService(CommitService):
             entries[name] = {"state": "present", "hash": sha(data), "size": size, "executable": os.name != "nt" and mode == "100755"}
             position = end + size + 2
 
-    def review(self, snapshot_id: str, *, verify: bool = True) -> dict:
+    def review(self, snapshot_id: str, *, verify: bool = True, selected: list[str] | None = None) -> dict:
         git, store = self.core.git, self.core.store
         context, target = git.context(), store.snapshot(snapshot_id, verify=verify)
         if context["busy"] or context["sparse"] or not context["branch"] or not git.clean_index():
@@ -78,7 +82,7 @@ class BoundaryCommitService(CommitService):
             raise SafetyError("Select a timeline snapshot from the current branch.")
         anchor = self.anchor(context)
         if anchor:
-            if target["endedAt"] <= anchor["boundaryAt"]:
+            if target["endedAt"] < anchor["boundaryAt"] or (target["endedAt"] == anchor["boundaryAt"] and not anchor.get("partial")):
                 raise SafetyError("Select a snapshot after the last committed boundary.")
             allowed_heads = anchor["sourceHeads"] + [context["head"]]
         else:
@@ -98,14 +102,28 @@ class BoundaryCommitService(CommitService):
             after[name] = desired
             before[name] = baseline.get(name, ABSENT)
         changes = changes_between(before, after)
+        omitted = []
+        if selected is not None:
+            if not isinstance(selected, list) or any(not isinstance(p, str) for p in selected):
+                raise SafetyError("Commit selection must be a list of file paths.")
+            for name in selected:
+                relative_path(name)
+            names = set(selected)
+            if len(names) != len(selected) or names - {c["path"] for c in changes}:
+                raise SafetyError("Commit selection contains duplicate or unavailable files. Review the file list again.")
+            omitted = [c for c in changes if c["path"] not in names]
+            changes = [c for c in changes if c["path"] in names]
         self.guard([c["path"] for c in changes])
         if not same_context(context, git.context()):
             raise SafetyError("Git state changed during boundary review.")
         title = store.metadata(snapshot_id).get("title", "") or summarize(changes)
-        return {"snapshotId": snapshot_id, "boundaryId": anchor["snapshotIds"][0] if anchor else None,
+        result = {"snapshotId": snapshot_id, "boundaryId": anchor["snapshotIds"][0] if anchor else None,
                 "context": context, "changes": changes, "skipped": skipped, "summary": title,
+                "omitted": omitted,
                 "message": suggest_commit([c["path"] for c in changes], title),
                 "sourceHeads": list(dict.fromkeys([*(anchor["sourceHeads"] if anchor else []), target["context"]["head"]]))}
+        result["reviewHash"] = digest(result)
+        return result
 
     def isolated(self, journal: dict) -> Git:
         directory = self.core.store.directory / "tmp" / validate_id(journal["id"])
@@ -117,12 +135,14 @@ class BoundaryCommitService(CommitService):
         return Git(worktree, self.core.git.executable, git_dir=Path(self.core.store.identity["gitDir"]),
                    index=directory / "index", hooks=journal["hooks"])
 
-    def prepare_boundary(self, snapshot_id: str) -> dict:
+    def prepare_boundary(self, snapshot_id: str, *, selected: list[str] | None = None, review_hash: str | None = None) -> dict:
         git, store = self.core.git, self.core.store
         store.assert_writer()
         if any(unfinished(j) for j in store.journals()):
             raise SafetyError("Review incomplete operations first.")
-        review = self.review(snapshot_id)
+        review = self.review(snapshot_id, selected=selected)
+        if review_hash is not None and review_hash != review["reviewHash"]:
+            raise SafetyError("Commit scope or Git state changed after review. Review the selection again.")
         target = store.snapshot(snapshot_id, verify=True)
         selected = [c["path"] for c in review["changes"]]
         if not selected:
@@ -132,11 +152,18 @@ class BoundaryCommitService(CommitService):
         journal = {"schema": 1, "id": new_id(), "kind": "commit", "mode": "boundary", "phase": "prepared",
                    "createdAt": utc_now(), "context": review["context"], "backupId": backup["id"],
                    "targetId": snapshot_id, "boundaryId": review["boundaryId"], "sourceHeads": review["sourceHeads"],
-                   "boundaryAt": target["endedAt"], "selected": selected, "changes": [], "applied": [], "conflicts": [],
+                   "boundaryAt": target["endedAt"], "selected": selected, "scope": selected, "changes": [], "applied": [], "conflicts": [],
                    "indexExisted": index is not None, "planHash": digest(review),
                    "policyHash": digest(self.core.config),
                    "hooks": git.text("rev-parse", "--path-format=absolute", "--git-path", "hooks"),
-                   "skipped": review["skipped"], "summary": review["summary"], "message": review["message"]}
+                   "skipped": review["skipped"], "summary": review["summary"], "message": review["message"],
+                   "partial": bool(review["omitted"])}
+        if journal["partial"]:
+            anchor = self.anchor(review["context"])
+            committed = {}
+            if anchor:
+                committed = anchor["committedEntries"] if anchor.get("partial") else store.snapshot(anchor["snapshotIds"][0])["entries"]
+            journal["committedEntries"] = {p: e for p, e in committed.items() if e["state"] != "excluded"}
         if index is not None:
             journal["indexBackupHash"] = store.put(index)
         store.journal(journal)
@@ -156,9 +183,7 @@ class BoundaryCommitService(CommitService):
             journal["step"] = "readTree"
             store.journal(journal)
             isolated.run("read-tree", review["context"]["head"] or "--empty")
-            head_entries = git.tree_entries(review["context"]["head"])
-            paths = [name for name, entry in target["entries"].items() if name not in skipped and entry["state"] != "excluded"
-                     and (entry["state"] == "present" or name in head_entries)]
+            paths = selected
             if paths:
                 journal["step"] = "stage"
                 store.journal(journal)
@@ -231,6 +256,10 @@ class BoundaryCommitService(CommitService):
                            "oid": after["head"], "parentOid": journal["context"]["head"], "reviewedTree": journal["preparedTree"],
                            "actualTree": actual_tree, "snapshotIds": [journal["targetId"]], "boundaryAt": journal["boundaryAt"],
                            "sourceHeads": journal["sourceHeads"], "selected": journal["selected"], "expected": expected, "createdAt": utc_now()}
+                if journal.get("partial"):
+                    target = store.snapshot(journal["targetId"])
+                    receipt["partial"] = True
+                    receipt["committedEntries"] = {**journal["committedEntries"], **{p: target["entries"][p] for p in journal["scope"]}}
                 # Record the commit before syncing the real index, so a crash has a durable receipt.
                 store.write_record("receipts", receipt["id"], receipt)
                 journal["receiptId"] = receipt["id"]

@@ -1,4 +1,4 @@
 {
   "version": "0.2.0",
-  "configurations": [{ "name": "Run Amberog", "type": "extensionHost", "request": "launch", "args": ["--extensionDevelopmentPath=${workspaceFolder}"], "outFiles": ["${workspaceFolder}/dist/**/*.js"], "preLaunchTask": "npm: build" }]
+  "configurations": [{ "name": "Run AmberTrail", "type": "extensionHost", "request": "launch", "args": ["--extensionDevelopmentPath=${workspaceFolder}"], "outFiles": ["${workspaceFolder}/dist/**/*.js"], "preLaunchTask": "npm: build" }]
 }

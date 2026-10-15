@@ -1,4 +1,4 @@
-name: Amberog checks
+name: AmberTrail checks
 on:
   push:
   pull_request:
@@ -34,7 +34,7 @@ jobs:
       - run: npm run package
       - uses: actions/upload-artifact@v4
         with:
-          name: amberog-${{ matrix.os }}-${{ matrix.vscode }}
+          name: ambertrail-${{ matrix.os }}-${{ matrix.vscode }}
           path: '*.vsix'
   minimum-git:
     runs-on: ubuntu-latest

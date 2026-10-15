@@ -15,11 +15,14 @@ async function scenario(): Promise<void> {
   assert.ok(extension, 'Extension must be registered');
   const api = await extension.activate(); assert.equal(api.ready, true, 'Python bridge and UI must activate');
   const commands = await vscode.commands.getCommands(true);
-  for (const name of ['captureNow', 'openDiff', 'restoreSnapshot', 'undoRestore', 'prepareCommit', 'renameSnapshot', 'push', 'recover']) assert.ok(commands.includes(`devSnapshot.${name}`));
+  for (const name of ['captureNow', 'openDiff', 'restoreSnapshot', 'undoRestore', 'prepareCommit', 'toggleCommitFile', 'renameSnapshot', 'deleteSnapshot', 'push', 'recover']) assert.ok(commands.includes(`devSnapshot.${name}`));
   const contributions = extension.packageJSON.contributes;
+  assert.equal(contributions.views.devSnapshot.find((view: { id: string }) => view.id === 'devSnapshot.timeline').type, 'webview');
+  await vscode.commands.executeCommand('devSnapshot.timeline.focus');
   const commitCommand = contributions.commands.find((item: { command: string }) => item.command === 'devSnapshot.prepareCommit');
   assert.equal(commitCommand.icon, '$(git-commit)');
-  assert.ok(contributions.menus['view/item/context'].some((item: { command: string; group: string }) => item.command === 'devSnapshot.prepareCommit' && item.group.startsWith('inline')));
+  const deleteCommand = contributions.commands.find((item: { command: string }) => item.command === 'devSnapshot.deleteSnapshot');
+  assert.equal(deleteCommand.icon, '$(trash)');
   const repo = process.env.DEV_SNAPSHOT_TEST_REPO!;
   for (let attempt = 0; attempt < 100; attempt++) {
     const status = await vscode.commands.executeCommand<unknown[]>('devSnapshot.refresh');
@@ -37,7 +40,7 @@ async function scenario(): Promise<void> {
   await fs.writeFile(current, 'print("external change")\n');
   await vscode.commands.executeCommand('devSnapshot.captureNow');
   const status = await vscode.commands.executeCommand<{ latestAt: string | null; job?: { state: string } }[]>('devSnapshot.refresh');
-  assert.ok(status?.some(r => r.latestAt && r.job?.state === 'complete'), 'Manual capture must publish a real completed snapshot');
+  assert.ok(status?.some(r => r.latestAt && r.job?.state === 'complete'), `Manual capture must publish a real completed snapshot: ${JSON.stringify(status)}`);
   assert.equal(await fs.readFile(current, 'utf8'), 'print("external change")\n');
   const doc = await vscode.workspace.openTextDocument(current);
   await vscode.window.showTextDocument(doc);
@@ -49,5 +52,5 @@ async function scenario(): Promise<void> {
   assert.equal(doc.isDirty, false);
   await vscode.commands.executeCommand('workbench.action.closeActiveEditor');
   await vscode.commands.executeCommand('devSnapshot.resumeRecording');
-  console.log('Amberog extension activation, commands, disk capture and unsaved-editor isolation passed.');
+  console.log('AmberTrail extension activation, commands, disk capture and unsaved-editor isolation passed.');
 }

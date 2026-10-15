@@ -1,8 +1,8 @@
 {
   "name": "dev-snapshot",
-  "displayName": "Amberog",
+  "displayName": "AmberTrail",
   "description": "Private local development snapshots with reviewed restore and Git commits.",
-  "version": "0.1.3",
+  "version": "0.2.1",
   "publisher": "dev-snapshot",
   "license": "MIT",
   "engines": { "vscode": "^1.95.0" },
@@ -11,43 +11,33 @@
   "activationEvents": ["onStartupFinished"],
   "main": "./dist/extension.js",
   "capabilities": {
-    "untrustedWorkspaces": { "supported": false, "description": "Amberog executes Git and restores local files only in trusted workspaces." },
+    "untrustedWorkspaces": { "supported": false, "description": "AmberTrail executes Git and restores local files only in trusted workspaces." },
     "virtualWorkspaces": { "supported": false, "description": "MVP requires a local filesystem and Git." }
   },
   "contributes": {
-    "viewsContainers": { "activitybar": [{ "id": "devSnapshot", "title": "Amberog", "icon": "media/snapshot.svg" }] },
-    "views": { "devSnapshot": [{ "id": "devSnapshot.timeline", "name": "작업 기록" }] },
+    "viewsContainers": { "activitybar": [{ "id": "devSnapshot", "title": "AmberTrail", "icon": "media/snapshot.svg" }] },
+    "views": { "devSnapshot": [{ "id": "devSnapshot.timeline", "name": "작업 기록", "type": "webview" }] },
     "commands": [
-      { "command": "devSnapshot.captureNow", "title": "Amberog: Capture Now", "icon": "$(add)" },
-      { "command": "devSnapshot.refresh", "title": "Amberog: Refresh", "icon": "$(refresh)" },
-      { "command": "devSnapshot.pauseRecording", "title": "Amberog: Pause Recording" },
-      { "command": "devSnapshot.resumeRecording", "title": "Amberog: Resume Recording" },
-      { "command": "devSnapshot.openDiff", "title": "Amberog: Compare with Previous Snapshot", "icon": "$(diff)" },
-      { "command": "devSnapshot.restoreSnapshot", "title": "Amberog: 스냅샷 복원", "icon": "$(history)" },
-      { "command": "devSnapshot.undoRestore", "title": "Amberog: Undo Last Restore" },
-      { "command": "devSnapshot.prepareCommit", "title": "Amberog: 이 시점까지의 작업 커밋", "icon": "$(git-commit)" },
-      { "command": "devSnapshot.renameSnapshot", "title": "Amberog: 작업 이름 편집", "icon": "$(edit)" },
-      { "command": "devSnapshot.push", "title": "Amberog: Review and Push" },
-      { "command": "devSnapshot.pinSnapshot", "title": "Amberog: Toggle Snapshot Pin", "icon": "$(pin)" },
-      { "command": "devSnapshot.manageHistory", "title": "Amberog: Manage History" },
-      { "command": "devSnapshot.recover", "title": "Amberog: Review Recovery" }
+      { "command": "devSnapshot.captureNow", "title": "AmberTrail: Capture Now", "icon": "$(add)" },
+      { "command": "devSnapshot.refresh", "title": "AmberTrail: Refresh", "icon": "$(refresh)" },
+      { "command": "devSnapshot.pauseRecording", "title": "AmberTrail: Pause Recording" },
+      { "command": "devSnapshot.resumeRecording", "title": "AmberTrail: Resume Recording" },
+      { "command": "devSnapshot.openDiff", "title": "AmberTrail: 스냅샷 변경 비교", "icon": "$(diff)" },
+      { "command": "devSnapshot.restoreSnapshot", "title": "AmberTrail: 스냅샷 복원", "icon": "$(history)" },
+      { "command": "devSnapshot.undoRestore", "title": "AmberTrail: Undo Last Restore" },
+      { "command": "devSnapshot.prepareCommit", "title": "AmberTrail: 이 시점까지의 작업 커밋", "icon": "$(git-commit)" },
+      { "command": "devSnapshot.toggleCommitFile", "title": "AmberTrail: 커밋 파일 포함/제외" },
+      { "command": "devSnapshot.renameSnapshot", "title": "AmberTrail: 작업 이름 편집", "icon": "$(edit)" },
+      { "command": "devSnapshot.deleteSnapshot", "title": "AmberTrail: 스냅샷 삭제", "icon": "$(trash)" },
+      { "command": "devSnapshot.push", "title": "AmberTrail: Review and Push" },
+      { "command": "devSnapshot.pinSnapshot", "title": "AmberTrail: Toggle Snapshot Pin", "icon": "$(pin)" },
+      { "command": "devSnapshot.manageHistory", "title": "AmberTrail: Manage History" },
+      { "command": "devSnapshot.recover", "title": "AmberTrail: Review Recovery" }
     ],
-    "menus": {
-      "view/title": [
-        { "command": "devSnapshot.captureNow", "when": "view == devSnapshot.timeline", "group": "navigation" },
-        { "command": "devSnapshot.refresh", "when": "view == devSnapshot.timeline", "group": "navigation" }
-      ],
-      "view/item/context": [
-        { "command": "devSnapshot.prepareCommit", "when": "view == devSnapshot.timeline && viewItem == snapshot", "group": "inline@1" },
-        { "command": "devSnapshot.restoreSnapshot", "when": "view == devSnapshot.timeline && viewItem == snapshot", "group": "inline@2" },
-        { "command": "devSnapshot.renameSnapshot", "when": "view == devSnapshot.timeline && viewItem == snapshot", "group": "edit@1" },
-        { "command": "devSnapshot.pinSnapshot", "when": "view == devSnapshot.timeline && viewItem == snapshot", "group": "edit@2" }
-      ]
-    },
     "configuration": {
-      "title": "Amberog",
+      "title": "AmberTrail",
       "properties": {
-        "devSnapshot.pythonPath": { "type": "string", "default": "", "scope": "application", "description": "Python 3.12+ executable dedicated to Amberog (for example a venv Python). Empty uses python on Windows or python3 on macOS/Linux. Reload the window after changing." },
+        "devSnapshot.pythonPath": { "type": "string", "default": "", "scope": "application", "description": "Python 3.12+ executable dedicated to AmberTrail (for example a venv Python). Empty uses python on Windows or python3 on macOS/Linux. Reload the window after changing." },
         "devSnapshot.idleSeconds": { "type": "number", "default": 5, "minimum": 1, "scope": "resource" },
         "devSnapshot.maxIntervalSeconds": { "type": "number", "default": 60, "minimum": 5, "scope": "resource" },
         "devSnapshot.reconcileSeconds": { "type": "number", "default": 120, "minimum": 10, "scope": "resource" },
@@ -67,10 +57,10 @@
     "compile:test": "tsc",
     "test": "npm run test:python && npm run test:bridge",
     "test:python": "node scripts/python.mjs backend/test_runner.py",
-    "test:bridge": "npm run compile:test && node --test out/test/bridge.test.js",
+    "test:bridge": "npm run compile:test && node --test out/test/bridge.test.js out/test/extension.test.js",
     "test:integration": "npm run build && npm run compile:test && node out/test/runIntegration.js",
     "benchmark": "node scripts/python.mjs backend/benchmark.py",
-    "package": "npm run build && vsce package --out amberog-0.1.3.vsix",
+    "package": "npm run build && vsce package --out ambertrail-0.2.1.vsix",
     "vscode:prepublish": "npm run check && npm run build"
   },
   "dependencies": {},

@@ -10,8 +10,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .common import (MAX_FILE, SafetyError, atomic_write, digest, encode, fsync_directory,
-                     is_link, native_path, read_json, sha, utc_now, validate_entries,
+                     is_link, native_path, read_json, relative_path, sha, utc_now, validate_entries,
                      validate_hash, validate_id, validate_title, write_json)
+from .restore_io import validate_move
 
 
 class Store:
@@ -191,6 +192,15 @@ class Store:
         if not isinstance(snapshot.get("context"), dict) or not isinstance(snapshot.get("endedAt"), str):
             raise SafetyError("Invalid snapshot context.")
         validate_entries(snapshot.get("entries"))
+        if "initialChanges" in snapshot:
+            if not isinstance(snapshot["initialChanges"], list):
+                raise SafetyError("Invalid initial change list.")
+            for name in snapshot["initialChanges"]:
+                relative_path(name)
+        if "initialBefore" in snapshot:
+            validate_entries(snapshot["initialBefore"])
+            if snapshot.get("reason") != "initial" or set(snapshot["initialBefore"]) != set(snapshot.get("initialChanges", [])):
+                raise SafetyError("Invalid initial comparison baseline.")
         if digest(snapshot["entries"]) != snapshot.get("treeHash"):
             raise SafetyError("Snapshot manifest failed integrity verification.")
 
@@ -200,7 +210,7 @@ class Store:
         if snapshot["id"] != snapshot_id:
             raise SafetyError("Snapshot identity mismatch.")
         if verify:
-            for entry in snapshot["entries"].values():
+            for entry in (*snapshot["entries"].values(), *snapshot.get("initialBefore", {}).values()):
                 if entry["state"] == "present":
                     self.get(entry["hash"], entry["size"])
         return snapshot
@@ -208,6 +218,29 @@ class Store:
     def snapshots(self) -> list[dict]:
         with self._headers_lock:
             return self._snapshot_headers()
+
+    def initial_changed_paths(self, snapshot: dict) -> list[str] | None:
+        """Use recorded startup status, never today's Git status, to classify old baselines."""
+        if snapshot["reason"] != "initial":
+            return None
+        if "initialChanges" in snapshot:
+            return snapshot["initialChanges"]
+        try:
+            epoch = read_json(self.record("epochs", snapshot["epochId"]))
+        except FileNotFoundError:
+            return None  # Missing evidence must not hide existing history.
+        paths = epoch.get("initialChanges")
+        if epoch.get("initialSnapshot") != snapshot["id"] or not isinstance(paths, list):
+            return None
+        entries = self.snapshot(snapshot["id"])["entries"]
+        return [name for name in paths if name in entries and entries[name]["state"] != "excluded"]
+
+    def is_internal_baseline(self, snapshot: dict) -> bool:
+        if snapshot["reason"] != "initial" or self.initial_changed_paths(snapshot) != []:
+            return False
+        metadata = self.metadata(snapshot["id"])
+        # Preserve records the user deliberately named, pinned, or linked to a commit.
+        return not (metadata["pinned"] or metadata.get("title") or metadata["commitIds"])
 
     def _snapshot_headers(self) -> list[dict]:
         directory = self.directory / "snapshots"
@@ -231,7 +264,7 @@ class Store:
                     header = cached[1]
                 else:
                     snapshot = self.snapshot(record_id)
-                    header = {k: v for k, v in snapshot.items() if k != "entries"}
+                    header = {k: v for k, v in snapshot.items() if k not in ("entries", "initialBefore")}
                     header["excludedCount"] = sum(e["state"] == "excluded" for e in snapshot["entries"].values())
                     self._headers[record_id] = (sig, header)
                 present.add(record_id)
@@ -276,6 +309,12 @@ class Store:
                 validate_entries({change["path"]: change["after"]})
             if item.get("targetId"):
                 validate_id(item["targetId"])
+            if not isinstance(item.get("fileMoves", []), list):
+                raise SafetyError("Invalid preserved restore file list.")
+            for move in item.get("fileMoves", []):
+                validate_move(move)
+            if "committedEntries" in item:
+                validate_entries(item["committedEntries"])
             result.append(item)
         return sorted(result, key=lambda j: j["createdAt"], reverse=True)
 
@@ -315,6 +354,11 @@ class Store:
                 if journal.get("targetId"):
                     protected.add(journal["targetId"])
         # Keep the last successful boundary of each branch until a newer one is committed.
+        for receipt in self.boundary_receipts().values():
+            protected.add(validate_id(receipt["snapshotIds"][0]))
+        return protected
+
+    def boundary_receipts(self) -> dict:
         boundaries = {}
         for source in (self.directory / "receipts").glob("*.json"):
             receipt = read_json(source)
@@ -322,23 +366,24 @@ class Store:
                 branch = receipt["branch"]
                 if branch not in boundaries or receipt["createdAt"] > boundaries[branch]["createdAt"]:
                     boundaries[branch] = receipt
-        for receipt in boundaries.values():
-            protected.add(validate_id(receipt["snapshotIds"][0]))
-        return protected
+        return boundaries
 
     def delete_snapshot(self, snapshot_id: str) -> None:
         with self._headers_lock:
             self._delete_snapshot(snapshot_id)
 
     def history_before(self, snapshot_id: str) -> dict:
-        """Review older history; independent manifests keep the cutoff restorable."""
+        """Review older history on the committed branch only."""
         target = self.snapshot(snapshot_id)
         if target["reason"] == "backup":
             raise SafetyError("Select a timeline snapshot as the cleanup boundary.")
         protected = self.protected_ids()
-        older = [s for s in self.snapshots() if s["endedAt"] < target["endedAt"]]
-        return {"snapshotId": snapshot_id, "cutoffAt": target["endedAt"],
-                "candidates": [{"id": s["id"], "endedAt": s["endedAt"], "reason": s["reason"]}
+        branch = target["context"]["branch"]
+        if not branch:
+            raise SafetyError("History cleanup requires a snapshot from an attached branch.")
+        older = [s for s in self.snapshots() if s["endedAt"] < target["endedAt"] and s["context"]["branch"] == branch]
+        return {"snapshotId": snapshot_id, "cutoffAt": target["endedAt"], "branch": branch,
+                "candidates": [{"id": s["id"], "endedAt": s["endedAt"], "reason": s["reason"], "branch": s["context"]["branch"]}
                                for s in older if s["id"] not in protected],
                 "protectedCount": sum(s["id"] in protected for s in older)}
 
@@ -375,6 +420,10 @@ class Store:
         for header in snapshots:
             snapshot = self.snapshot(header["id"])
             live.update(e["hash"] for e in snapshot["entries"].values() if e["state"] == "present")
+            live.update(e["hash"] for e in snapshot.get("initialBefore", {}).values() if e["state"] == "present")
+        for receipt in self.boundary_receipts().values():
+            entries = validate_entries(receipt.get("committedEntries", {}))
+            live.update(e["hash"] for e in entries.values() if e["state"] == "present")
         for journal in self.journals():
             if journal["phase"] not in ("complete", "rolledBack", "resolved"):
                 if journal["backupId"] not in ids:
@@ -401,14 +450,15 @@ class Store:
         protected = self.protected_ids()
         for header in snapshots:
             self.snapshot(header["id"])  # Validate every manifest before deleting any history.
-        count = sum(s["reason"] != "backup" for s in snapshots)
+        count = sum(s["reason"] != "backup" and not self.is_internal_baseline(s) for s in snapshots)
         expiry = (datetime.now(timezone.utc) - timedelta(days=config["retentionDays"])).isoformat()
         for snapshot in reversed(snapshots):
             if snapshot["id"] in protected:
                 continue
             if snapshot["endedAt"] < expiry or snapshot["reason"] == "backup" or count > config["maxSnapshots"]:
+                normal_record = snapshot["reason"] != "backup" and not self.is_internal_baseline(snapshot)
                 self.delete_snapshot(snapshot["id"])
-                count -= snapshot["reason"] != "backup"
+                count -= normal_record
         self.gc()
         limit = int(config["maxStorageMiB"] * 1024 * 1024)
         if self.usage() > limit:

@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .common import (ABSENT, SafetyError, digest, metadata_is_link, new_id, relative_path,
-                     safe_path, signature, utc_now)
+                     safe_path, sha, signature, utc_now)
 from .git import Git, same_context
 from .store import Store, protect_backup
 
@@ -102,7 +102,6 @@ class SnapshotService:
                     raise SafetyError("File changed while being read.")
             if signature(target.lstat()) != sig:
                 raise SafetyError("File changed while being read.")
-            from .common import sha
             entry = {"state": "present", "hash": self.store.put(data) if persist else sha(data),
                      "size": len(data), "executable": os.name != "nt" and bool(before.st_mode & 0o111)}
             if persist:
@@ -115,6 +114,30 @@ class SnapshotService:
     def latest(self) -> dict | None:
         header = next((s for s in self.store.snapshots() if s["reason"] != "backup"), None)
         return self.store.snapshot(header["id"]) if header else None
+
+    def head_entries(self, head: str | None, paths: list[str], *, persist: bool = True) -> dict:
+        """Read only the managed startup changes from the exact recorded HEAD."""
+        tree = self.git.tree_entries(head) if paths else {}
+        entries = {}
+        for name in paths:
+            if persist and self.cancelled.is_set():
+                raise SafetyError("Capture cancelled before publication.")
+            relative_path(name)
+            if name not in tree:
+                entries[name] = dict(ABSENT)
+                continue
+            mode, oid = tree[name]
+            if mode not in ("100644", "100755"):
+                raise SafetyError("An initial comparison baseline contains an unsupported Git file type.")
+            size = int(self.git.text("cat-file", "-s", oid))
+            if size > self.config["maxFileMiB"] * 1024 * 1024:
+                raise SafetyError("An initial comparison baseline exceeds the configured file limit.")
+            data = self.git.run("cat-file", "blob", oid)
+            if len(data) != size:
+                raise SafetyError("An initial comparison baseline could not be read completely.")
+            entries[name] = {"state": "present", "hash": self.store.put(data) if persist else sha(data),
+                             "size": size, "executable": os.name != "nt" and mode == "100755"}
+        return entries
 
     def capture(self, reason: str = "manual", *, full: bool = True,
                 changed_paths: set[str] | None = None) -> dict | None:
@@ -178,21 +201,34 @@ class SnapshotService:
                 if not new_epoch and previous["treeHash"] == tree_hash:
                     return None
                 record_id, epoch_id = new_id(), new_id() if new_epoch else previous["epochId"]
+                initial_changes = None
                 if new_epoch:
-                    changes = [s["path"] for s in self.git.statuses()]
+                    statuses = self.git.statuses()
+                    changes = sorted({name for s in statuses for name in (s["path"], s.get("original", s["path"]))})
+                    initial_changes = [name for name in changes if name in entries and entries[name]["state"] != "excluded"]
+                    initial_before = self.head_entries(context["head"], initial_changes)
+                    initial_diff = changes_between(initial_before, {name: entries[name] for name in initial_changes})
+                    initial_changes = [c["path"] for c in initial_diff]
+                    initial_before = {name: initial_before[name] for name in initial_changes}
+                    if self.cancelled.is_set():
+                        raise SafetyError("Capture cancelled before publication.")
                     if not same_context(context, self.git.context()) or generation != self.generation:
                         continue
                     self.store.write_record("epochs", epoch_id, {
                         "schema": 1, "id": epoch_id, "branch": context["branch"], "head": context["head"],
-                        "initialSnapshot": record_id, "initialChanges": changes})
+                        "initialSnapshot": record_id, "initialChanges": initial_changes})
                 snapshot = {"schema": 1, "id": record_id, "repositoryId": self.store.identity["id"],
                             "epochId": epoch_id, "previousSnapshotId": previous["id"] if previous else None,
                             "startedAt": started, "endedAt": utc_now(), "reason": "initial" if new_epoch else reason,
                             "context": context, "policyHash": digest(self.config), "treeHash": tree_hash, "entries": entries}
                 changes = changes_between(previous["entries"] if previous else {}, entries)
+                if initial_changes is not None:
+                    snapshot["initialChanges"] = initial_changes
+                    snapshot["initialBefore"] = initial_before
+                    changes = initial_diff
                 snapshot["summary"] = snapshot_summary(changes)
                 snapshot["summaryVersion"] = 3
-                snapshot["changedFiles"] = len(changes)
+                snapshot["changedFiles"] = len(initial_changes) if initial_changes is not None else len(changes)
                 self.store.save_snapshot(snapshot)
                 return snapshot
             except (FileNotFoundError, SafetyError):
