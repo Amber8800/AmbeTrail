@@ -1,6 +1,8 @@
 **
 !dist/extension.js
 !media/snapshot.svg
+!media/timeline.css
+!media/timeline.js
 !package.json
 !backend/run.py
 !backend/dev_snapshot/*.py

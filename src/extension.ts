@@ -3,15 +3,24 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { PythonBridge } from './bridge';
 import { ReviewDocuments } from './documents';
-import { compactTime, repositoryStatus, workTitle } from './presentation';
+import { TimelineView } from './timelineView';
+import { branchColor, branchLabel, compactTime, repositoryStatus, snapshotContext, workTitle } from './presentation';
 import { BoundaryReview, CaptureJob, Change, Diff, GitContext, Journal, PushReview, Receipt, Repository, RestorePlan, SnapshotItem } from './protocol';
 
 interface GitRepository { rootUri: vscode.Uri; state: { onDidChange: vscode.Event<void> } }
 interface GitApi { git: { path: string }; repositories: GitRepository[]; onDidOpenRepository: vscode.Event<GitRepository>; onDidCloseRepository: vscode.Event<GitRepository> }
 interface GitExtension { enabled: boolean; getAPI(version: 1): GitApi; onDidChangeEnablement: vscode.Event<boolean> }
 
+interface HistorySnapshot {
+  id: string; endedAt: string; reason: string; internalBaseline: boolean; protected: boolean;
+  title: string; context: GitContext;
+}
+interface HistoryUsage { bytes: number; limit: number; snapshots: HistorySnapshot[] }
+
 type Kind = 'repository' | 'snapshot' | 'file' | 'message' | 'recovery' | 'more';
 class Item extends vscode.TreeItem {
+  commitIncluded?: boolean;
+  commitOnly?: boolean;
   constructor(readonly kind: Kind, label: string, readonly repository?: Repository, readonly snapshot?: SnapshotItem, readonly change?: Change, readonly journal?: Journal) {
     super(label, ['repository', 'snapshot'].includes(kind) ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None);
     this.contextValue = kind;
@@ -52,10 +61,12 @@ class Timeline implements vscode.TreeDataProvider<Item> {
         node.id = `${repo.id}/${snapshot.id}`;
         node.description = compactTime(snapshot.endedAt);
         if (snapshot.boundaryState === 'committed') node.description += ' · 커밋됨';
-        node.tooltip = `${workTitle(snapshot)}\n${new Date(snapshot.endedAt).toLocaleString()}\n이번 기록: 파일 ${snapshot.changedFiles}개 변경 · 미검증${snapshot.metadata.pinned ? ' · 고정' : ''}${snapshot.metadata.commitIds.length ? ' · 커밋 연결' : ''}\n자동 요약: ${snapshot.summary}\n${snapshot.reason === 'initial' ? '확장 시작 전에 존재하던 미커밋 작업' : snapshot.reason}\n커밋 버튼: 직전 커밋 경계부터 이 시점까지 / 복원 버튼: 이 스냅샷 복원\n우클릭 → 작업 이름 편집\n복원 시 객체 무결성을 검사합니다. 정상 동작을 검증한 상태는 아닙니다.\n${snapshot.comparisonPruned ? '이전 비교 기록이 삭제되어 포함 파일 기준으로 표시합니다.' : ''}`;
+        else if (snapshot.boundaryState === 'partial') node.description += ' · 일부 커밋';
+        node.tooltip = `${workTitle(snapshot)}\n${new Date(snapshot.endedAt).toLocaleString()}\n${snapshotContext(snapshot.context)}\n이번 기록: 파일 ${snapshot.changedFiles}개 변경 · 미검증${snapshot.metadata.pinned ? ' · 고정' : ''}${snapshot.metadata.commitIds.length ? ' · 커밋 연결' : ''}\n자동 요약: ${snapshot.summary}\n${snapshot.reason === 'initial' ? '확장 시작 전에 존재하던 미커밋 작업' : snapshot.reason}\n커밋 버튼: 직전 커밋 경계부터 이 시점까지 / 복원 버튼: 이 스냅샷 복원 / 휴지통: 기록 삭제\n우클릭 → 작업 이름 편집\n복원 시 객체 무결성을 검사합니다. 정상 동작을 검증한 상태는 아닙니다.\n${snapshot.comparisonPruned ? '이전 비교 기록이 삭제되어 포함 파일 기준으로 표시합니다.' : ''}`;
         if (snapshot.commitSummary && snapshot.commitChangedFiles != null) node.tooltip += `\n커밋 대상 구간: ${snapshot.commitSummary} · 파일 ${snapshot.commitChangedFiles}개`;
         if (snapshot.rangeError) node.tooltip += `\n커밋 구간 계산 불가: ${snapshot.rangeError}\n이번 기록의 요약은 그대로 표시합니다.`;
-        node.iconPath = new vscode.ThemeIcon(snapshot.metadata.pinned ? 'pinned' : snapshot.boundaryState === 'committed' ? 'check' : 'circle-small-filled');
+        node.accessibilityInformation = { label: `${workTitle(snapshot)} · ${snapshotContext(snapshot.context)}` };
+        node.iconPath = new vscode.ThemeIcon(snapshot.metadata.pinned ? 'pinned' : snapshot.boundaryState === 'committed' ? 'check' : 'circle-small-filled', new vscode.ThemeColor(branchColor(snapshot.context.branch)));
         result.push(node);
       }
       if (snapshots.length === limit && limit < 1000) {
@@ -66,19 +77,44 @@ class Timeline implements vscode.TreeDataProvider<Item> {
       return result;
     }
     if (item.kind === 'snapshot' && item.snapshot) {
-      const changes = await this.app.call<Change[]>('snapshotChanges', repo, { snapshotId: item.snapshot.id });
+      const context = item.snapshot.context;
+      const branch = new Item('message', `브랜치: ${branchLabel(context)}`, repo);
+      branch.id = `${repo.id}/branch/${item.snapshot.id}`;
+      branch.description = context.head?.slice(0, 8) || '커밋 없음';
+      branch.tooltip = snapshotContext(context);
+      branch.iconPath = new vscode.ThemeIcon('git-branch', new vscode.ThemeColor(branchColor(context.branch)));
+      const changes = [...await this.app.call<Change[]>('snapshotChanges', repo, { snapshotId: item.snapshot.id })];
+      const local = new Set(changes.map(c => c.path));
+      const candidates = new Map<string, Change>();
+      const messages: Item[] = [];
+      if (repo.writable && ['ready', 'partial'].includes(item.snapshot.boundaryState ?? '')) {
+        try {
+          const review = await this.app.call<BoundaryReview>('commitBoundaryReview', repo, { snapshotId: item.snapshot.id });
+          for (const change of review.changes) {
+            candidates.set(change.path, change);
+            if (!local.has(change.path)) changes.push(change);
+          }
+        } catch (error) {
+          const warning = new Item('message', error instanceof Error ? error.message : '커밋 대상 파일을 불러오지 못했습니다.', repo);
+          warning.id = `${repo.id}/commit-warning/${item.snapshot.id}`; warning.description = 'commit-warning'; messages.push(warning);
+        }
+      }
+      const excluded = this.app.commitExclusions(repo, item.snapshot);
       const filenames = new Map<string, number>();
       for (const change of changes) { const name = path.posix.basename(change.path); filenames.set(name, (filenames.get(name) ?? 0) + 1); }
-      return changes.map(change => {
+      return [branch, ...messages, ...changes.map(localChange => {
+        const change = candidates.get(localChange.path) ?? localChange;
         const kind = change.kind === 'added' ? '추가' : change.kind === 'deleted' ? '삭제' : '수정';
         const node = new Item('file', path.posix.basename(change.path), repo, item.snapshot, change);
         node.id = `${repo.id}/${item.snapshot!.id}/${change.path}`;
+        if (candidates.has(change.path)) node.commitIncluded = !excluded.has(change.path);
+        node.commitOnly = !local.has(change.path);
         node.description = (filenames.get(path.posix.basename(change.path)) ?? 0) > 1 ? `${kind} · ${path.posix.dirname(change.path)}` : kind;
         node.tooltip = `${change.path}\n${kind}${change.after.state === 'present' ? ` · ${change.after.size.toLocaleString()} B` : ''}`;
         node.iconPath = new vscode.ThemeIcon(change.kind === 'added' ? 'diff-added' : change.kind === 'deleted' ? 'diff-removed' : 'diff-modified');
         node.command = { command: 'devSnapshot.openDiff', title: 'Diff', arguments: [node] };
         return node;
-      });
+      })];
     }
     return [];
   }
@@ -94,9 +130,19 @@ class Application {
   private gitApi?: GitApi;
   private stopped = false;
   private errorShown = new Set<string>();
+  commitExclusions(repo: Repository, snapshot: SnapshotItem): Set<string> {
+    return new Set(this.context.workspaceState.get<Record<string, string[]>>('commitExclusions', {})[`${repo.id}/${snapshot.id}`] ?? []);
+  }
+  private async saveCommitExclusions(repo: Repository, snapshot: SnapshotItem, excluded: Set<string>): Promise<void> {
+    const saved = { ...this.context.workspaceState.get<Record<string, string[]>>('commitExclusions', {}) };
+    const key = `${repo.id}/${snapshot.id}`;
+    if (excluded.size) saved[key] = [...excluded]; else delete saved[key];
+    await this.context.workspaceState.update('commitExclusions', saved);
+  }
   constructor(readonly context: vscode.ExtensionContext, readonly bridge: PythonBridge) {}
   async start(): Promise<void> {
-    this.context.subscriptions.push(vscode.window.registerTreeDataProvider('devSnapshot.timeline', this.timeline), vscode.workspace.registerTextDocumentContentProvider('dev-snapshot', this.documents));
+    const view = new TimelineView(this.timeline, this.context.extensionUri);
+    this.context.subscriptions.push(view, vscode.window.registerWebviewViewProvider('devSnapshot.timeline', view), vscode.workspace.registerTextDocumentContentProvider('dev-snapshot', this.documents));
     this.commands();
     this.bridge.on('changed', () => this.scheduleRefresh());
     this.bridge.on('failure', (error: Error) => { this.status = error.message; this.timeline.refresh(); void vscode.window.showErrorMessage(error.message); });
@@ -111,7 +157,7 @@ class Application {
       await this.bridge.call('offline', { storageRoot: this.context.globalStorageUri.fsPath, roots: (vscode.workspace.workspaceFolders ?? []).map(f => f.uri.fsPath) });
       this.status = '내장 Git 확장을 활성화하면 기록을 시작할 수 있습니다.';
     }
-    if (git) this.context.subscriptions.push(git.onDidChangeEnablement(() => { void vscode.window.showInformationMessage('Git 활성화 상태가 변경되었습니다. Amberog을 다시 연결하려면 창을 다시 로드하세요.', '창 다시 로드').then(choice => { if (choice) void vscode.commands.executeCommand('workbench.action.reloadWindow'); }); }));
+    if (git) this.context.subscriptions.push(git.onDidChangeEnablement(() => { void vscode.window.showInformationMessage('Git 활성화 상태가 변경되었습니다. AmberTrail을 다시 연결하려면 창을 다시 로드하세요.', '창 다시 로드').then(choice => { if (choice) void vscode.commands.executeCommand('workbench.action.reloadWindow'); }); }));
     this.context.subscriptions.push(
       vscode.workspace.onDidSaveTextDocument(doc => this.event(doc.uri)),
       vscode.workspace.onDidChangeTextDocument(() => this.dirty()),
@@ -185,7 +231,7 @@ class Application {
   private scheduleRefresh(): void { if (!this.timer && !this.stopped) this.timer = setTimeout(() => { this.timer = undefined; void this.refresh().catch(e => this.error(e)); }, 200); }
   private async refresh(): Promise<void> { if (this.stopped) return; this.repositories = await this.bridge.call<Repository[]>('list'); this.timeline.refresh(); }
   private error(error: unknown): void {
-    const message = error instanceof Error ? error.message : 'Amberog 작업에 실패했습니다.';
+    const message = error instanceof Error ? error.message : 'AmberTrail 작업에 실패했습니다.';
     if (!this.errorShown.has(message)) { this.errorShown.add(message); void vscode.window.showErrorMessage(message); }
   }
   private async repository(item?: Item): Promise<Repository | undefined> {
@@ -217,7 +263,7 @@ class Application {
   private async restore(repo: Repository, undo: boolean, item?: Item): Promise<void> {
     const target = undo ? undefined : await this.snapshot(repo, item); if (!undo && !target) return;
     this.dirty();
-    const prepared = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'Amberog: 복원 영향 분석 및 보호 백업 중' }, async () => undo ? await this.call<{ plan: RestorePlan; undoes: string }>('undoPrepare', repo) : { plan: await this.call<RestorePlan>('restorePrepare', repo, { snapshotId: target!.id }), undoes: undefined });
+    const prepared = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'AmberTrail: 복원 영향 분석 및 보호 백업 중' }, async () => undo ? await this.call<{ plan: RestorePlan; undoes: string }>('undoPrepare', repo) : { plan: await this.call<RestorePlan>('restorePrepare', repo, { snapshotId: target!.id }), undoes: undefined });
     const { plan } = prepared;
     try {
       await this.documents.text('복원 검토', [
@@ -233,34 +279,38 @@ class Application {
       const approval = await vscode.window.showWarningMessage(`파일 ${plan.changes.length}개를 변경합니다. 삭제 ${plan.changes.filter(c => c.after.state === 'absent').length}개. 백업을 확인했고 외부 파일 수정 프로세스를 중지했습니까?`, { modal: true }, '수정 중지 확인 · 복원');
       if (!approval) return;
       this.dirty();
-      await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'Amberog: 복원 및 검증 중' }, () => this.call('restoreApply', repo, { planId: plan.id, undoes: prepared.undoes, approved: true, writersStopped: true }));
+      await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'AmberTrail: 복원 및 검증 중' }, () => this.call('restoreApply', repo, { planId: plan.id, undoes: prepared.undoes, approved: true, writersStopped: true }));
       void vscode.window.showInformationMessage('복원이 완료되었습니다. 코드의 정상 동작은 별도로 검증하세요.');
     } finally { await this.call('restoreCancel', repo, { planId: plan.id }); await this.refresh(); }
   }
   private async commit(repo: Repository, item?: Item): Promise<void> {
     const reference = await this.snapshot(repo, item);
     if (!reference) return;
-    const review = await this.call<BoundaryReview>('commitBoundaryReview', repo, { snapshotId: reference.id });
-    if (!review.changes.length) { void vscode.window.showInformationMessage('이 구간에는 커밋할 최종 변경이 없습니다.'); return; }
+    const available = await this.call<BoundaryReview>('commitBoundaryReview', repo, { snapshotId: reference.id });
+    const excluded = this.commitExclusions(repo, reference);
+    const selected = available.changes.filter(c => !excluded.has(c.path)).map(c => c.path);
+    const review = await this.call<BoundaryReview>('commitBoundaryReview', repo, { snapshotId: reference.id, selected });
+    if (!review.changes.length) { void vscode.window.showInformationMessage('커밋에 포함할 파일이 없습니다. 파일 목록의 + 버튼으로 포함해 주세요.'); return; }
     await this.documents.text('스냅샷 구간 커밋 검토', [
       `작업: ${review.summary}`, `시작 경계: ${review.boundaryId ?? '현재 브랜치의 기준 HEAD'}`,
       `완료 경계: ${reference.id} · ${new Date(reference.endedAt).toLocaleString()}`, `부모 커밋: ${review.context.head ?? '첫 커밋'}`,
-      `구간 변경: ${review.changes.length}개 파일`, '이 구간의 변경 전체를 한 커밋으로 만듭니다. 최신 작업 파일은 유지합니다.', '',
-      ...review.changes.map(c => `${c.kind}  ${c.path}`), '', '관리 범위에서 제외되어 기존 Git 상태를 유지하는 파일:',
+      `커밋에 포함: ${review.changes.length}개 파일`, '선택한 파일만 커밋합니다. 제외한 변경은 다음 커밋에 포함할 수 있습니다. 최신 작업 파일은 유지합니다.', '',
+      ...review.changes.map(c => `${c.kind}  ${c.path}`), '', `이번 커밋에서 제외: ${review.omitted.length}개 파일`, ...review.omitted.map(c => c.path), '', '관리 범위에서 제외되어 기존 Git 상태를 유지하는 파일:',
       ...review.skipped.map(s => `${s.path}: ${s.reason}`),
     ].join('\n'));
     const message = await vscode.window.showInputBox({ title: '이 구간의 커밋 메시지', value: review.message, validateInput: text => !text.trim() ? '메시지가 필요합니다.' : undefined });
     if (!message) return;
     if (!await vscode.window.showWarningMessage('선택한 스냅샷을 별도 작업 폴더와 임시 인덱스에서 준비하고 실제 Git 변환 결과를 검토합니다. Git 필터를 사용합니다. 다른 Git 쓰기 작업을 중지하세요.', { modal: true }, '구간 커밋 준비 승인')) return;
     this.dirty();
-    const journal = await this.call<Journal>('commitPrepare', repo, { snapshotId: reference.id, approved: true });
+    const journal = await this.call<Journal>('commitPrepare', repo, { snapshotId: reference.id, selected, reviewHash: review.reviewHash, approved: true });
     let executed = false;
     try {
-      if (!await this.reviewFiles(repo, journal.selected ?? [], { kind: 'boundaryStaged', operationId: journal.id }, '구간 전체의 실제 Staging 검토')) return;
-      if (!await vscode.window.showWarningMessage(`이 시점까지의 변경 전체(${journal.selected?.length ?? 0}개 파일)를 현재 브랜치에 커밋합니다.\n${message}\n최신 작업 파일을 유지합니다. Git 훅·서명은 별도 작업 폴더에서 실행하며, 프로젝트 의존성이 필요하면 실패할 수 있습니다.`, { modal: true }, '구간 전체 커밋 승인')) return;
+      if (!await this.reviewFiles(repo, journal.selected ?? [], { kind: 'boundaryStaged', operationId: journal.id }, '선택한 파일의 실제 Staging 검토')) return;
+      if (!await vscode.window.showWarningMessage(`선택한 파일 ${journal.selected?.length ?? 0}개를 현재 브랜치에 커밋합니다. 제외한 변경은 유지합니다.\n${message}\n최신 작업 파일을 유지합니다. Git 훅·서명은 별도 작업 폴더에서 실행하며, 프로젝트 의존성이 필요하면 실패할 수 있습니다.`, { modal: true }, '선택한 파일 커밋 승인')) return;
       this.dirty(); executed = true;
-      const receipt = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'Amberog: 커밋 실행 및 검증 중' }, () => this.call<Receipt>('commitExecute', repo, { operationId: journal.id, message, snapshotIds: [reference.id], approved: true }));
-      if (receipt.expected) void vscode.window.showInformationMessage(`커밋 완료: ${receipt.oid.slice(0, 10)}. Push는 별도 승인입니다.`);
+      const receipt = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'AmberTrail: 커밋 실행 및 검증 중' }, () => this.call<Receipt>('commitExecute', repo, { operationId: journal.id, message, snapshotIds: [reference.id], approved: true }));
+      if (receipt.expected) await this.saveCommitExclusions(repo, reference, new Set());
+      if (receipt.expected) void vscode.window.showInformationMessage(`커밋 완료: ${receipt.oid.slice(0, 10)}.${receipt.partial ? ' 남은 파일은 같은 기록에서 별도로 커밋할 수 있습니다.' : ''} Push는 별도 승인입니다.`);
       else void vscode.window.showWarningMessage('커밋이 생성되었지만 검토한 상태와 다릅니다. 자동으로 이력을 변경하지 않았습니다. 복구 검토를 여세요.');
       if (receipt.cleanupError) void vscode.window.showWarningMessage('커밋은 완료되었지만 이전 기록의 삭제 목록을 준비하지 못했습니다. 기록 관리에서 확인하세요.');
       if (receipt.cleanup) {
@@ -268,14 +318,14 @@ class Application {
         try {
           if (review.candidates.length) {
             await this.documents.text('커밋 후 이전 스냅샷 정리', [
-              `완료된 커밋: ${receipt.oid}`, `선택한 스냅샷: ${review.snapshotId}`, `기준 시각: ${new Date(review.cutoffAt).toLocaleString()}`,
+              `완료된 커밋: ${receipt.oid}`, `정리 브랜치: ${review.branch.replace(/^refs\/heads\//, '')}`, `선택한 스냅샷: ${review.snapshotId}`, `기준 시각: ${new Date(review.cutoffAt).toLocaleString()}`,
               `삭제 대상: ${review.candidates.length}개 / 보호되어 유지: ${review.protectedCount}개`,
-              '선택한 스냅샷과 이후 기록은 유지합니다. 고정 기록·활성 작업 시작 상태·복구 백업은 보호합니다.',
+              '다른 브랜치의 기록과 선택한 스냅샷·이후 기록은 유지합니다. 고정 기록·활성 작업 시작 상태·복구 백업은 보호합니다.',
               '기록 관리에서 제외한 파일과 Git 변환 전 원본 바이트는 Git 커밋의 보존 범위와 다를 수 있습니다.',
               '삭제한 기록은 되돌릴 수 없습니다. 취소하면 모든 기록을 유지합니다.', '',
-              ...review.candidates.map(s => `${new Date(s.endedAt).toLocaleString()} · ${s.reason} · ${s.id}`),
+              ...review.candidates.map(s => `${new Date(s.endedAt).toLocaleString()} · ${s.branch.replace(/^refs\/heads\//, '')} · ${s.reason} · ${s.id}`),
             ].join('\n'));
-            if (await vscode.window.showWarningMessage(`커밋이 완료되었습니다. 선택한 스냅샷보다 오래된 기록 ${review.candidates.length}개를 영구 삭제할까요? 보호 기록 ${review.protectedCount}개는 유지합니다.`, { modal: true }, '이전 기록 삭제 승인')) {
+            if (await vscode.window.showWarningMessage(`${review.branch.replace(/^refs\/heads\//, '')} 브랜치에서 선택한 스냅샷보다 오래된 기록 ${review.candidates.length}개를 영구 삭제할까요? 다른 브랜치의 기록과 보호 기록 ${review.protectedCount}개는 유지합니다.`, { modal: true }, '이전 기록 삭제 승인')) {
               const result = await this.call<{ deleted: number }>('historyDelete', repo, { token: review.token, approved: true });
               void vscode.window.showInformationMessage(`이전 스냅샷 ${result.deleted}개를 삭제했습니다.`);
             }
@@ -288,15 +338,16 @@ class Application {
     const review = await this.call<PushReview>('pushReview', repo);
     await this.documents.text('Push 검토', [`원격: ${review.remote}`, `대상 브랜치: ${review.branch}`, `전송할 OID: ${review.context.head}`, '', '로컬 upstream 기준 커밋 목록:', ...review.commits, '', '원격 상태를 자동 fetch하지 않습니다. 강제 Push와 태그 일괄 Push를 하지 않습니다.'].join('\n'));
     if (!await vscode.window.showWarningMessage(`${review.remote}의 ${review.branch}로 검토한 커밋을 전송합니까?`, { modal: true }, 'Push 승인')) return;
-    await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'Amberog: Push 중' }, () => this.call('pushExecute', repo, { token: review.token, approved: true }));
+    await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'AmberTrail: Push 중' }, () => this.call('pushExecute', repo, { token: review.token, approved: true }));
     void vscode.window.showInformationMessage('Push가 완료되었습니다.');
   }
   private async recover(repo: Repository, item?: Item): Promise<void> {
     let journal = item?.journal;
     if (!journal) journal = (await vscode.window.showQuickPick(repo.recoveries.map(j => ({ label: `${j.kind}: ${j.phase}`, description: j.createdAt, journal: j })), { title: '미완료 작업 선택' }))?.journal;
     if (!journal) return;
-    const report = await this.call<{ journal: Journal; files: { path: string; status: string }[]; currentContext: GitContext }>('recoveryReport', repo, { operationId: journal.id });
-    await this.documents.text('복구 상태', [`작업: ${journal.id}`, `상태: ${journal.phase}`, `보호 백업: ${journal.backupId}`, `작업 전 HEAD: ${report.journal.context?.head ?? '없음'}`, `현재 HEAD: ${report.currentContext.head ?? '없음'}`, `Git 작업 또는 잠금 감지: ${report.currentContext.busy ? '있음' : '없음'}`, '', ...report.files.map(f => `${f.status}  ${f.path}`), '', 'before: 작업 이전 / after: 확장 적용 결과 / conflict: 별도 수정 또는 불확실', '충돌 파일은 자동으로 덮어쓰지 않습니다. 커밋 이력은 자동 reset하지 않습니다.', ...(journal.mode === 'boundary' ? ['구간 커밋은 확인된 커밋 결과에 맞춰 인덱스를 복구하며 최신 작업 파일을 유지합니다.', '강제 종료 후 index.lock이 남으면 다른 Git 프로세스가 없는지 확인하고 수동 정리해야 합니다.', `마지막 잠금 소유 프로세스(참고): ${report.journal.indexLockOwnerPid ?? '미확인'}`] : [])].join('\n'));
+    const report = await this.call<{ journal: Journal; files: { path: string; status: string }[]; currentContext: GitContext; preservedFiles: { path: string; directory: string }[] }>('recoveryReport', repo, { operationId: journal.id });
+    const preserved = report.preservedFiles.length ? ['외부 변경 보존 폴더 (저장소 기준 경로):', ...report.preservedFiles.map(f => `${f.path}: ${f.directory}`), '보존 파일은 백업 내보내기에 함께 포함됩니다. 내용을 확인하기 전에는 폴더를 삭제하지 마세요.', '직접 해결 확인 후에도 보존 폴더는 자동 삭제하지 않습니다.', ''] : [];
+    await this.documents.text('복구 상태', [`작업: ${journal.id}`, `상태: ${journal.phase}`, `보호 백업: ${journal.backupId}`, `작업 전 HEAD: ${report.journal.context?.head ?? '없음'}`, `현재 HEAD: ${report.currentContext.head ?? '없음'}`, `Git 작업 또는 잠금 감지: ${report.currentContext.busy ? '있음' : '없음'}`, '', ...report.files.map(f => `${f.status}  ${f.path}`), '', ...preserved, 'before: 작업 이전 / after: 확장 적용 결과 / conflict: 별도 수정 또는 불확실', '충돌 파일은 자동으로 덮어쓰지 않습니다. 커밋 이력은 자동 reset하지 않습니다.', ...(journal.mode === 'boundary' ? ['구간 커밋은 확인된 커밋 결과에 맞춰 인덱스를 복구하며 최신 작업 파일을 유지합니다.', '강제 종료 후 index.lock이 남으면 다른 Git 프로세스가 없는지 확인하고 수동 정리해야 합니다.', `마지막 잠금 소유 프로세스(참고): ${report.journal.indexLockOwnerPid ?? '미확인'}`] : [])].join('\n'));
     const action = await vscode.window.showQuickPick([journal.mode === 'boundary' ? '생성된 커밋 확인 및 안전한 인덱스 복구' : '안전하게 이전 상태로 복구 시도', '백업 파일을 외부 폴더로 내보내기', '직접 해결했음을 확인하고 기록 재개 허용'], { title: '복구 작업 선택' });
     if (!action) return;
     if (action.startsWith('안전하게') || action.startsWith('생성된')) {
@@ -305,7 +356,7 @@ class Application {
     } else if (action.startsWith('백업')) {
       const destination = await vscode.window.showOpenDialog({ canSelectFolders: true, canSelectFiles: false, canSelectMany: false, title: '저장소 밖의 백업 내보내기 폴더 선택' });
       if (!destination?.[0]) return;
-      const result = await this.call<string>('exportBackup', repo, { snapshotId: journal.backupId, destination: destination[0].fsPath, approved: true });
+      const result = await this.call<string>('exportBackup', repo, { snapshotId: journal.backupId, operationId: journal.id, destination: destination[0].fsPath, approved: true });
       void vscode.window.showInformationMessage(`보호 백업을 내보냈습니다: ${result}`);
     } else {
       if (!await vscode.window.showWarningMessage('작업 파일과 Git 상태를 직접 검토·해결했음을 확인합니까? 이 동작은 파일을 복구하지 않습니다.', { modal: true }, '해결 확인')) return;
@@ -313,19 +364,43 @@ class Application {
     }
     await this.refresh();
   }
+  private async deleteSnapshot(repo: Repository, target: { id: string }): Promise<void> {
+    if (!repo.writable) {
+      void vscode.window.showInformationMessage('읽기 전용 세션에서는 기록을 삭제할 수 없습니다.');
+      return;
+    }
+    const usage = await this.call<HistoryUsage>('usage', repo);
+    const snapshot = usage.snapshots.find(s => s.id === target.id);
+    if (!snapshot) {
+      void vscode.window.showInformationMessage('이미 삭제되었거나 더 이상 사용할 수 없는 기록입니다.');
+      return;
+    }
+    if (snapshot.protected) {
+      void vscode.window.showInformationMessage('보호된 기록은 삭제할 수 없습니다. 최신 기록, 고정 기록, 활성 초기 상태, 최신 커밋 경계 또는 복구용 보호 기록에 해당합니다.');
+      return;
+    }
+    const approved = await vscode.window.showWarningMessage([
+      '이 스냅샷을 영구 삭제합니까?', `작업: ${snapshot.title}`,
+      `저장 시각: ${new Date(snapshot.endedAt).toLocaleString()}`, snapshotContext(snapshot.context),
+      '다른 기록에 참조되지 않는 파일 내용도 정리됩니다.',
+    ].join('\n'), { modal: true }, '기록 삭제 승인');
+    if (approved !== '기록 삭제 승인') return;
+    await this.call('deleteSnapshot', repo, { snapshotId: snapshot.id, approved: true });
+    await this.refresh();
+  }
   private async manage(repo: Repository): Promise<void> {
-    const usage = await this.call<{ bytes: number; limit: number; snapshots: { id: string; endedAt: string; reason: string; internalBaseline: boolean; protected: boolean }[] }>('usage', repo);
+    const usage = await this.call<HistoryUsage>('usage', repo);
     const action = await vscode.window.showQuickPick(['보존 정책으로 정리', '스냅샷 삭제', repo.paused ? '자동 기록 재개' : '자동 기록 일시 중지'], { title: `기록 관리 · ${(usage.bytes / 1048576).toFixed(1)} / ${(usage.limit / 1048576).toFixed(0)} MiB` });
     if (!action) return;
     if (action === '보존 정책으로 정리') await this.call('prune', repo);
     else if (action === '스냅샷 삭제') {
-      const picked = await vscode.window.showQuickPick(usage.snapshots.filter(s => !s.protected).map(s => ({ label: `${new Date(s.endedAt).toLocaleString()} · ${s.internalBaseline ? '이전 내부 비교 기준' : s.reason}`, id: s.id })), { title: '삭제할 비보호 기록 선택 · 제외 정책 변경은 과거 기록을 지우지 않습니다' });
-      if (picked && await vscode.window.showWarningMessage('이 스냅샷을 영구 삭제합니까? 다른 기록에 참조되지 않는 파일 내용도 정리됩니다.', { modal: true }, '기록 삭제 승인')) await this.call('deleteSnapshot', repo, { snapshotId: picked.id, approved: true });
+      const picked = await vscode.window.showQuickPick(usage.snapshots.filter(s => !s.protected).map(s => ({ label: s.title, description: compactTime(s.endedAt), detail: `${snapshotContext(s.context).replace('\n', ' · ')}${s.internalBaseline ? ' · 이전 내부 비교 기준' : s.reason === 'backup' ? ' · 보호 기간이 끝난 백업' : ''}`, id: s.id })), { title: '삭제할 비보호 기록 선택 · 제외 정책 변경은 과거 기록을 지우지 않습니다' });
+      if (picked) await this.deleteSnapshot(repo, picked);
     } else await this.call(repo.paused ? 'resume' : 'pause', repo);
     await this.refresh();
   }
   private async capture(repo: Repository): Promise<void> {
-    await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'Amberog: 저장된 파일 기록 중', cancellable: true }, async (progress, token) => {
+    await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'AmberTrail: 저장된 파일 기록 중', cancellable: true }, async (progress, token) => {
       let job = await this.call<CaptureJob>('capture', repo);
       const subscription = token.onCancellationRequested(() => { void this.call('cancelCapture', repo).catch(e => this.error(e)); });
       try {
@@ -352,6 +427,14 @@ class Application {
     register('restoreSnapshot', (repo, item) => this.restore(repo, false, item));
     register('undoRestore', repo => this.restore(repo, true));
     register('prepareCommit', (repo, item) => this.commit(repo, item));
+    register('toggleCommitFile', async (repo, item) => {
+      if (!repo.writable || !item?.snapshot || !item.change || item.commitIncluded === undefined) return;
+      const review = await this.call<BoundaryReview>('commitBoundaryReview', repo, { snapshotId: item.snapshot.id });
+      if (!review.changes.some(c => c.path === item.change!.path)) throw new Error('커밋 대상이 변경되었습니다. 파일 목록을 새로고침해 주세요.');
+      const excluded = this.commitExclusions(repo, item.snapshot);
+      if (excluded.has(item.change.path)) excluded.delete(item.change.path); else excluded.add(item.change.path);
+      await this.saveCommitExclusions(repo, item.snapshot, excluded);
+    });
     register('renameSnapshot', async (repo, item) => {
       const snapshot = await this.snapshot(repo, item); if (!snapshot) return;
       const title = await vscode.window.showInputBox({
@@ -363,6 +446,7 @@ class Application {
     });
     register('push', repo => this.push(repo));
     register('pinSnapshot', async (repo, item) => { const snapshot = await this.snapshot(repo, item); if (snapshot) await this.call('pin', repo, { snapshotId: snapshot.id }); });
+    register('deleteSnapshot', async (repo, item) => { const snapshot = await this.snapshot(repo, item); if (snapshot) await this.deleteSnapshot(repo, snapshot); });
     register('manageHistory', repo => this.manage(repo));
     register('recover', (repo, item) => this.recover(repo, item));
     register('more', async repo => { this.timeline.limits.set(repo.id, (this.timeline.limits.get(repo.id) ?? 50) + 50); this.timeline.refresh(); });
@@ -370,7 +454,7 @@ class Application {
       const snapshot = await this.snapshot(repo, item); if (!snapshot) return;
       let change = item?.change;
       if (!change) change = (await vscode.window.showQuickPick((await this.call<Change[]>('snapshotChanges', repo, { snapshotId: snapshot.id })).map(c => ({ label: c.path, change: c })), { title: '비교 파일 선택' }))?.change;
-      if (change) await this.documents.diff(await this.call<Diff>('diff', repo, { snapshotId: snapshot.id, path: change.path }), '스냅샷 비교');
+      if (change) await this.documents.diff(await this.call<Diff>('diff', repo, { snapshotId: snapshot.id, path: change.path, ...(item?.commitIncluded !== undefined ? { kind: 'boundary' } : {}) }), item?.commitIncluded !== undefined ? '커밋 대상 변경' : snapshot.reason === 'initial' ? '저장 당시 HEAD와 비교' : '스냅샷 비교');
     });
     this.context.subscriptions.push(vscode.commands.registerCommand('devSnapshot.refresh', async () => {
       try { await this.refresh(); return this.repositories; } catch (e) { this.error(e); return []; }
@@ -395,6 +479,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ read
   const bridge = new PythonBridge(python, path.join(context.extensionPath, 'backend/run.py'), context.extensionPath);
   application = new Application(context, bridge);
   try { await application.start(); return { ready: true }; }
-  catch (e) { void vscode.window.showErrorMessage(e instanceof Error ? e.message : 'Amberog 시작 실패'); return { ready: false }; }
+  catch (e) { void vscode.window.showErrorMessage(e instanceof Error ? e.message : 'AmberTrail 시작 실패'); return { ready: false }; }
 }
 export async function deactivate(): Promise<void> { await application?.stop(); application = undefined; }

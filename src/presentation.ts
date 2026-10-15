@@ -1,4 +1,21 @@
-import { Repository, SnapshotItem } from './protocol';
+import { GitContext, Repository, SnapshotItem } from './protocol';
+
+const branchColors = ['charts.blue', 'charts.green', 'charts.purple', 'charts.orange', 'charts.yellow', 'charts.red'];
+
+export function branchColor(branch: string | null): string {
+  if (!branch) return 'descriptionForeground';
+  let hash = 0;
+  for (const character of branch) hash = (Math.imul(hash, 31) + character.codePointAt(0)!) >>> 0;
+  return branchColors[hash % branchColors.length]!;
+}
+
+export function branchLabel(context: GitContext): string {
+  return context.branch?.replace(/^refs\/heads\//, '') || '브랜치 없음';
+}
+
+export function snapshotContext(context: GitContext): string {
+  return `브랜치: ${branchLabel(context)}\nHEAD: ${context.head?.slice(0, 8) || '커밋 없음'}`;
+}
 
 export function compactTime(value: string, now = new Date()): string {
   const date = new Date(value);
