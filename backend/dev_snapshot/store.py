@@ -197,6 +197,10 @@ class Store:
                 raise SafetyError("Invalid initial change list.")
             for name in snapshot["initialChanges"]:
                 relative_path(name)
+        if "initialBefore" in snapshot:
+            validate_entries(snapshot["initialBefore"])
+            if snapshot.get("reason") != "initial" or set(snapshot["initialBefore"]) != set(snapshot.get("initialChanges", [])):
+                raise SafetyError("Invalid initial comparison baseline.")
         if digest(snapshot["entries"]) != snapshot.get("treeHash"):
             raise SafetyError("Snapshot manifest failed integrity verification.")
 
@@ -206,7 +210,7 @@ class Store:
         if snapshot["id"] != snapshot_id:
             raise SafetyError("Snapshot identity mismatch.")
         if verify:
-            for entry in snapshot["entries"].values():
+            for entry in (*snapshot["entries"].values(), *snapshot.get("initialBefore", {}).values()):
                 if entry["state"] == "present":
                     self.get(entry["hash"], entry["size"])
         return snapshot
@@ -260,7 +264,7 @@ class Store:
                     header = cached[1]
                 else:
                     snapshot = self.snapshot(record_id)
-                    header = {k: v for k, v in snapshot.items() if k != "entries"}
+                    header = {k: v for k, v in snapshot.items() if k not in ("entries", "initialBefore")}
                     header["excludedCount"] = sum(e["state"] == "excluded" for e in snapshot["entries"].values())
                     self._headers[record_id] = (sig, header)
                 present.add(record_id)
@@ -411,6 +415,7 @@ class Store:
         for header in snapshots:
             snapshot = self.snapshot(header["id"])
             live.update(e["hash"] for e in snapshot["entries"].values() if e["state"] == "present")
+            live.update(e["hash"] for e in snapshot.get("initialBefore", {}).values() if e["state"] == "present")
         for journal in self.journals():
             if journal["phase"] not in ("complete", "rolledBack", "resolved"):
                 if journal["backupId"] not in ids:

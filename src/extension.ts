@@ -411,7 +411,7 @@ class Application {
       const snapshot = await this.snapshot(repo, item); if (!snapshot) return;
       let change = item?.change;
       if (!change) change = (await vscode.window.showQuickPick((await this.call<Change[]>('snapshotChanges', repo, { snapshotId: snapshot.id })).map(c => ({ label: c.path, change: c })), { title: '비교 파일 선택' }))?.change;
-      if (change) await this.documents.diff(await this.call<Diff>('diff', repo, { snapshotId: snapshot.id, path: change.path }), '스냅샷 비교');
+      if (change) await this.documents.diff(await this.call<Diff>('diff', repo, { snapshotId: snapshot.id, path: change.path }), snapshot.reason === 'initial' ? '저장 당시 HEAD와 비교' : '스냅샷 비교');
     });
     this.context.subscriptions.push(vscode.commands.registerCommand('devSnapshot.refresh', async () => {
       try { await this.refresh(); return this.repositories; } catch (e) { this.error(e); return []; }

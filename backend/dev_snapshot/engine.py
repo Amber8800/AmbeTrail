@@ -31,8 +31,9 @@ def display_bytes(data: bytes | None) -> str:
 
 
 class Session:
-    def __init__(self, git: Git, store: Store, config: dict):
+    def __init__(self, git: Git, store: Store, config: dict, *, git_enabled: bool = True):
         self.git, self.store = git, store
+        self.git_enabled = git_enabled
         self.core = SnapshotService(git, store, config)
         self.dirty: set[str] = set()
         self.restore = RestoreService(self.core, lambda: self.dirty)
@@ -169,7 +170,7 @@ class Session:
         self.work_summaries = {k: v for k, v in self.work_summaries.items() if k[0] in indexed}
         self.interval_summaries = {k: v for k, v in self.interval_summaries.items() if k[0] in indexed}
         context, anchor, baseline, range_error = None, None, None, None
-        if self.store.writable and not (self.worker and self.worker.is_alive()) and not any(unfinished(j) for j in self.store.journals()):
+        if self.git_enabled and self.store.writable and not (self.worker and self.worker.is_alive()) and not any(unfinished(j) for j in self.store.journals()):
             try:
                 context = self.git.context()
                 if not context["busy"] and not context["sparse"] and context["branch"]:
@@ -182,7 +183,7 @@ class Session:
         visible = [s for s in snapshots if not self.store.is_internal_baseline(s)]
         for s in visible[:max(1, min(limit, 1000))]:
             previous = indexed.get(s["previousSnapshotId"], {})
-            comparison_pruned = bool(s["previousSnapshotId"] and not previous)
+            comparison_pruned = bool(s["reason"] != "initial" and s["previousSnapshotId"] and not previous)
             summary = s.get("summary", "저장된 파일 상태")
             changed_files = s.get("changedFiles", 0)
             initial_paths = self.store.initial_changed_paths(s)
@@ -190,7 +191,7 @@ class Session:
                 changed_files = len(initial_paths)
             commit_summary, commit_changed_files = None, None
             boundary_state = "unavailable"
-            if s.get("summaryVersion") != 3 and not comparison_pruned:
+            if s.get("summaryVersion") != 3 and not comparison_pruned and (self.git_enabled or s["reason"] != "initial"):
                 key = (s["id"], comparison_pruned)
                 if key not in self.work_summaries:
                     self.work_summaries[key] = snapshot_summary(self.snapshot_changes(s["id"]))
@@ -215,17 +216,22 @@ class Session:
     def snapshot_changes(self, snapshot_id: str) -> list[dict]:
         snapshot = self.store.snapshot(snapshot_id)
         before = {}
-        if snapshot["previousSnapshotId"]:
+        initial_paths = self.store.initial_changed_paths(snapshot)
+        if snapshot["reason"] == "initial":
+            if "initialBefore" in snapshot:
+                before = snapshot["initialBefore"]
+            else:
+                if not self.git_enabled and snapshot["context"]["head"]:
+                    raise SafetyError("Enable Git to compare this older initial snapshot with its recorded HEAD.")
+                paths = initial_paths if initial_paths is not None else [p for p, e in snapshot["entries"].items() if e["state"] != "excluded"]
+                before = self.core.head_entries(snapshot["context"]["head"], paths, persist=False)
+        elif snapshot["previousSnapshotId"]:
             try:
                 before = self.store.snapshot(snapshot["previousSnapshotId"])["entries"]
             except FileNotFoundError:
                 pass
-        changes = changes_between(before, snapshot["entries"])
-        initial_paths = self.store.initial_changed_paths(snapshot)
-        if initial_paths is not None:
-            initial_set = set(initial_paths)
-            changes = [c for c in changes if c["path"] in initial_set]
-        return changes
+        after = snapshot["entries"] if initial_paths is None else {p: snapshot["entries"][p] for p in initial_paths}
+        return changes_between(before, after)
 
     def entry_content(self, entry: dict) -> bytes | None:
         return self.store.get(entry["hash"], entry["size"]) if entry["state"] == "present" else None
@@ -237,7 +243,11 @@ class Session:
             change = next((c for c in self.snapshot_changes(params["snapshotId"]) if c["path"] == name), None)
             if not change:
                 raise SafetyError("This file is not a change in the selected snapshot.")
-            before, after = self.entry_content(change["before"]), self.entry_content(change["after"])
+            snapshot = self.store.snapshot(params["snapshotId"])
+            before = (self.git.file_content(name, head=snapshot["context"]["head"])
+                      if snapshot["reason"] == "initial" and "initialBefore" not in snapshot
+                      else self.entry_content(change["before"]))
+            after = self.entry_content(change["after"])
         elif kind == "restore":
             plan = self.restore.plans.get(params["planId"])
             if not plan:
@@ -301,7 +311,7 @@ class Engine:
 
     def call(self, method: str, params: dict) -> object:
         if method == "hello":
-            return {"protocol": 1, "version": "0.2.0", "python": os.sys.version.split()[0]}
+            return {"protocol": 1, "version": "0.2.1", "python": os.sys.version.split()[0]}
         if method == "open":
             config = settings_from(params.get("settings"))
             git = Git(Path(params["root"]).resolve(strict=True), params.get("gitPath", "git"))
@@ -331,7 +341,7 @@ class Engine:
                 if not any(root == r or r.is_relative_to(root) for r in roots):
                     continue
                 store = Store(directory, identity, readonly=True)
-                session = Session(Git(root), store, settings_from(None))
+                session = Session(Git(root), store, settings_from(None), git_enabled=False)
                 session.message = "Git 비활성 · 과거 기록 조회 전용"
                 self.sessions[identity["id"]] = session
             return [s.summary() for s in self.sessions.values()]

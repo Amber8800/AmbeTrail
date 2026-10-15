@@ -124,9 +124,112 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(Session(self.git, store, self.config).timeline(), [])
         self.assertEqual(startup["entries"][".env"]["state"], "excluded")
 
+    def test_branch_first_snapshot_compares_carried_work_with_its_saved_head(self):
+        self.write("a.txt", b"carried work")
+        previous = self.core.capture()
+        self.git.run("switch", "-c", "feature/carried")
+        first = self.core.capture()
+        session = Session(self.git, self.store, self.config)
+        self.assertEqual(first["previousSnapshotId"], previous["id"])
+        changes = session.snapshot_changes(first["id"])
+        self.assertEqual([(c["path"], c["kind"]) for c in changes], [("a.txt", "modified")])
+        self.assertEqual(session.timeline()[0]["changedFiles"], len(changes))
+        diff = session.diff({"snapshotId": first["id"], "path": "a.txt"})
+        self.assertEqual(diff["left"], "baseline\r\n")
+        self.assertEqual(diff["right"], "carried work")
+        self.write("a.txt", b"next work")
+        following = self.core.capture()
+        self.assertEqual(session.diff({"snapshotId": following["id"], "path": "a.txt"})["left"], "carried work")
+
+    def test_branch_first_snapshot_uses_destination_head_and_survives_gc_offline(self):
+        self.git.run("switch", "-c", "feature/different-head")
+        self.write("a.txt", b"feature baseline")
+        self.git.add(["a.txt"])
+        self.git.run("commit", "-m", "feature baseline")
+        self.git.run("switch", "main")
+        self.write("b.txt", b"carried local work")
+        self.core.capture()
+        self.git.run("switch", "feature/different-head")
+        self.write("a.txt", b"carried local work")
+        first = self.core.capture()
+        self.assertEqual(first["summary"], "a.txt·b.txt 수정")
+        # This HEAD version has never been captured as worktree content.
+        baseline_hash = first["initialBefore"]["a.txt"]["hash"]
+        self.store.gc()
+        self.assertEqual(self.store.get(baseline_hash), b"feature baseline")
+        self.write("a.txt", b"feature baseline")
+        self.git.run("switch", "main")
+        reader = Store(self.store.directory, self.identity, readonly=True)
+        self.addCleanup(reader.close)
+        session = Session(self.git, reader, self.config, git_enabled=False)
+        with patch.object(self.git, "run", side_effect=AssertionError("Stored comparisons must not run Git")):
+            diff = session.diff({"snapshotId": first["id"], "path": "a.txt"})
+        self.assertEqual(diff["left"], "feature baseline")
+        self.assertEqual(diff["right"], "carried local work")
+        self.assertFalse(next(s for s in session.timeline() if s["id"] == first["id"])["comparisonPruned"])
+        self.core.capture()  # A new main epoch releases the feature epoch's protection.
+        self.store.delete_snapshot(first["id"])
+        self.store.gc()
+        self.assertFalse(self.store._object(baseline_hash).exists(), "Deleting the owning snapshot must release its baseline")
+
+    def test_branch_first_snapshot_shows_carried_additions_deletions_and_renames(self):
+        (self.root / "a.txt").rename(self.root / "renamed.txt")
+        (self.root / "b.txt").unlink()
+        self.write("new.txt", b"new local file")
+        self.core.capture()
+        self.git.run("switch", "-c", "feature/files")
+        first = self.core.capture()
+        session = Session(self.git, self.store, self.config)
+        changes = session.snapshot_changes(first["id"])
+        self.assertEqual({c["path"]: c["kind"] for c in changes}, {
+            "a.txt": "deleted", "b.txt": "deleted", "new.txt": "added", "renamed.txt": "added"})
+        self.assertEqual(session.timeline()[0]["changedFiles"], len(changes))
+        removed = session.diff({"snapshotId": first["id"], "path": "a.txt"})
+        self.assertEqual(removed["left"], "baseline\r\n")
+        self.assertTrue(removed["rightAbsent"])
+        added = session.diff({"snapshotId": first["id"], "path": "new.txt"})
+        self.assertTrue(added["leftAbsent"])
+        self.assertEqual(added["right"], "new local file")
+
+    def test_legacy_branch_first_snapshot_uses_recorded_head_without_rewriting_history(self):
+        self.write("a.txt", b"carried work")
+        self.core.capture()
+        self.git.run("switch", "-c", "feature/legacy")
+        first = self.core.capture()
+        first.pop("initialBefore")
+        first["summaryVersion"] = 2
+        path = self.store.record("snapshots", first["id"])
+        write_json(path, first)
+        original = path.read_bytes()
+        self.git.add(["a.txt"])
+        self.git.run("commit", "-m", "advance after capture")
+        session = Session(self.git, self.store, self.config)
+        diff = session.diff({"snapshotId": first["id"], "path": "a.txt"})
+        self.assertEqual(diff["left"], "baseline\r\n")
+        self.assertEqual(diff["right"], "carried work")
+        self.assertEqual(path.read_bytes(), original)
+        session.git_enabled = False
+        with patch.object(self.git, "run", side_effect=AssertionError("Git is disabled")):
+            self.assertTrue(any(s["id"] == first["id"] for s in session.timeline()))
+        with self.assertRaisesRegex(SafetyError, "Enable Git"):
+            session.snapshot_changes(first["id"])
+
+    def test_branch_first_snapshot_does_not_count_index_only_changes_as_disk_changes(self):
+        self.write("a.txt", b"staged work")
+        self.git.add(["a.txt"])
+        self.write("a.txt", b"baseline\r\n")
+        self.git.run("switch", "-c", "feature/index-only")
+        index = self.git.index_bytes()
+        first = self.core.capture()
+        self.assertEqual(first["initialChanges"], [])
+        self.assertEqual(first["changedFiles"], 0)
+        self.assertEqual(Session(self.git, self.store, self.config).snapshot_changes(first["id"]), [])
+        self.assertEqual(self.git.index_bytes(), index)
+
     def test_legacy_clean_baseline_is_hidden_without_rewriting_or_losing_pins(self):
         legacy = dict(self.initial)
         legacy.pop("initialChanges")
+        legacy.pop("initialBefore")
         legacy["changedFiles"] = 2
         path = self.store.record("snapshots", legacy["id"])
         write_json(path, legacy)
@@ -148,6 +251,7 @@ class CoreTests(unittest.TestCase):
         self.addCleanup(store.close)
         startup = SnapshotService(self.git, store, self.config).capture()
         startup.pop("initialChanges")
+        startup.pop("initialBefore")
         startup["changedFiles"] = 2
         write_json(store.record("snapshots", startup["id"]), startup)
         self.git.run("checkout", "--", "a.txt")  # Classification uses startup evidence, not today's clean tree.
@@ -649,7 +753,15 @@ class CoreTests(unittest.TestCase):
         store = Store(self.base / "empty-store", identity)
         self.addCleanup(store.close)
         core = SnapshotService(git, store, settings_from(None))
-        self.assertIsNone(core.capture()["context"]["head"])
+        initial = core.capture()
+        self.assertIsNone(initial["context"]["head"])
+        initial.pop("initialBefore")  # Older unborn-HEAD records need no Git baseline lookup.
+        write_json(store.record("snapshots", initial["id"]), initial)
+        offline = Session(git, store, settings_from(None), git_enabled=False)
+        with patch.object(git, "run", side_effect=AssertionError("Git is disabled")):
+            diff = offline.diff({"snapshotId": initial["id"], "path": "hello.py"})
+        self.assertTrue(diff["leftAbsent"])
+        self.assertEqual(diff["right"], "print('hello')\n")
         service = CommitService(core)
         journal = service.prepare(["hello.py"])
         self.assertFalse(journal["indexExisted"])
