@@ -9,6 +9,8 @@ export interface TimelineNode extends vscode.TreeItem {
   readonly snapshot?: SnapshotItem;
   readonly change?: Change;
   readonly journal?: Journal;
+  readonly commitIncluded?: boolean;
+  readonly commitOnly?: boolean;
 }
 interface TimelineSource {
   readonly onDidChangeTreeData: vscode.Event<TimelineNode | undefined>;
@@ -18,7 +20,7 @@ interface TimelineSource {
 const actions: Record<TimelineNode['kind'], readonly string[]> = {
   repository: ['captureNow', 'refresh', 'manageHistory', 'pauseRecording', 'resumeRecording'],
   snapshot: ['openDiff', 'prepareCommit', 'restoreSnapshot', 'renameSnapshot', 'pinSnapshot', 'deleteSnapshot'],
-  file: ['openDiff'], recovery: ['recover'], more: ['more'], message: [],
+  file: ['openDiff', 'toggleCommitFile'], recovery: ['recover'], more: ['more'], message: [],
 };
 
 /** The webview only sends opaque item IDs. All actions use host-owned objects and existing reviewed commands. */
@@ -47,7 +49,7 @@ export class TimelineView implements vscode.WebviewViewProvider, vscode.Disposab
     view.webview.html = `<!doctype html><html lang="ko"><head><meta charset="utf-8">
       <meta name="viewport" content="width=device-width, initial-scale=1">
       <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${view.webview.cspSource}; script-src 'nonce-${nonce}';">
-      <link rel="stylesheet" href="${css}"><title>Amberog 작업 기록</title></head>
+      <link rel="stylesheet" href="${css}"><title>AmberTrail 작업 기록</title></head>
       <body><main id="app" aria-label="작업 기록"><p class="empty">기록을 불러오는 중…</p></main>
       <div id="notice" role="status" aria-live="polite"></div><script nonce="${nonce}" src="${script}"></script></body></html>`;
     this.viewSubscriptions = [
@@ -73,11 +75,11 @@ export class TimelineView implements vscode.WebviewViewProvider, vscode.Disposab
       ...(node.kind === 'snapshot' && snapshot ? {
         endedAt: snapshot.endedAt, time: compactTime(snapshot.endedAt), branch: branchLabel(snapshot.context),
         color: branchColor(snapshot.context.branch).replace('.', '-'), head: snapshot.context.head?.slice(0, 8) || '커밋 없음',
-        changedFiles: snapshot.changedFiles, pinned: snapshot.metadata.pinned, committed: snapshot.boundaryState === 'committed',
+        changedFiles: snapshot.changedFiles, pinned: snapshot.metadata.pinned, committed: snapshot.boundaryState === 'committed', partial: snapshot.boundaryState === 'partial',
         summary: snapshot.summary, rangeError: snapshot.rangeError, comparisonPruned: snapshot.comparisonPruned,
         commitSummary: snapshot.commitSummary, commitChangedFiles: snapshot.commitChangedFiles,
       } : {}),
-      ...(node.kind === 'file' && node.change ? { path: node.change.path, change: node.change.kind || 'modified' } : {}),
+      ...(node.kind === 'file' && node.change ? { path: node.change.path, change: node.change.kind || 'modified', commitIncluded: node.commitIncluded, commitOnly: node.commitOnly } : {}),
     };
   }
 

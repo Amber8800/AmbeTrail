@@ -313,6 +313,8 @@ class Store:
                 raise SafetyError("Invalid preserved restore file list.")
             for move in item.get("fileMoves", []):
                 validate_move(move)
+            if "committedEntries" in item:
+                validate_entries(item["committedEntries"])
             result.append(item)
         return sorted(result, key=lambda j: j["createdAt"], reverse=True)
 
@@ -352,6 +354,11 @@ class Store:
                 if journal.get("targetId"):
                     protected.add(journal["targetId"])
         # Keep the last successful boundary of each branch until a newer one is committed.
+        for receipt in self.boundary_receipts().values():
+            protected.add(validate_id(receipt["snapshotIds"][0]))
+        return protected
+
+    def boundary_receipts(self) -> dict:
         boundaries = {}
         for source in (self.directory / "receipts").glob("*.json"):
             receipt = read_json(source)
@@ -359,9 +366,7 @@ class Store:
                 branch = receipt["branch"]
                 if branch not in boundaries or receipt["createdAt"] > boundaries[branch]["createdAt"]:
                     boundaries[branch] = receipt
-        for receipt in boundaries.values():
-            protected.add(validate_id(receipt["snapshotIds"][0]))
-        return protected
+        return boundaries
 
     def delete_snapshot(self, snapshot_id: str) -> None:
         with self._headers_lock:
@@ -416,6 +421,9 @@ class Store:
             snapshot = self.snapshot(header["id"])
             live.update(e["hash"] for e in snapshot["entries"].values() if e["state"] == "present")
             live.update(e["hash"] for e in snapshot.get("initialBefore", {}).values() if e["state"] == "present")
+        for receipt in self.boundary_receipts().values():
+            entries = validate_entries(receipt.get("committedEntries", {}))
+            live.update(e["hash"] for e in entries.values() if e["state"] == "present")
         for journal in self.journals():
             if journal["phase"] not in ("complete", "rolledBack", "resolved"):
                 if journal["backupId"] not in ids:

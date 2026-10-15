@@ -16,13 +16,14 @@ function snapshot(id: string, overrides: Partial<SnapshotItem> = {}): SnapshotIt
 }
 
 // Exercise the real activation, provider, and command handlers with isolated VS Code/RPC adapters.
-async function harness(snapshots = [snapshot('selected')]) {
+async function harness(snapshots = [snapshot('selected')], workspaceValues = new Map<string, unknown>()) {
   const repo: Repository = { id: 'repo', root: 'C:/fixture', writable: true, paused: true, status: '', dirtyCount: 0,
     latestAt: null, branch: context.branch, excludedCount: 0, recoveries: [] };
   const state = {
     snapshots, protected: new Set<string>(), changes: [] as Change[], warningChoice: undefined as string | undefined,
     warnings: [] as string[], messages: [] as string[], errors: [] as string[], calls: [] as { method: string; params: Record<string, unknown> }[],
     picks: [] as unknown[], pickItems: [] as { label: string; detail?: string }[][], deleteError: undefined as Error | undefined,
+    commitChanges: undefined as Change[] | undefined, documents: [] as string[], input: undefined as string | undefined, workspaceValues,
   };
   let provider: vscode.TreeDataProvider<vscode.TreeItem> | undefined;
   let webviewProvider: { source: typeof provider; resolveWebviewView(view: unknown): void; dispose(): void };
@@ -46,6 +47,13 @@ async function harness(snapshots = [snapshot('selected')]) {
       if (method === 'list') return [repo];
       if (method === 'timeline') return state.snapshots;
       if (method === 'snapshotChanges') return state.changes;
+      if (method === 'commitBoundaryReview') {
+        const available = state.commitChanges ?? state.changes;
+        const changes = params.selected === undefined ? available : available.filter(c => (params.selected as string[]).includes(c.path));
+        return { snapshotId: params.snapshotId, boundaryId: null, context, changes, omitted: available.filter(c => !changes.includes(c)), skipped: [], summary: '선택 작업', message: 'feat: selected', reviewHash: 'review/' + changes.map(c => c.path).join(',') };
+      }
+      if (method === 'commitPrepare') return { id: 'operation', kind: 'commit', phase: 'applying', selected: params.selected, changes: [] };
+      if (method === 'commitExecute') return { oid: '0123456789abcdef', expected: true };
       if (method === 'usage') return { bytes: 0, limit: 1024, snapshots: state.snapshots.map(s => ({
         ...s, title: s.metadata.title || s.summary, internalBaseline: false, protected: state.protected.has(s.id),
       })) };
@@ -62,6 +70,7 @@ async function harness(snapshots = [snapshot('selected')]) {
     ThemeColor: class { constructor(public id: string) {} },
     EventEmitter: class { event = event; fire() {} },
     UIKind: { Desktop: 1 }, ExtensionMode: { Development: 2 }, env: { uiKind: 1 },
+    ProgressLocation: { Notification: 1 },
     Uri: { joinPath: (_base: unknown, ...parts: string[]) => parts.join('/') },
     extensions: { getExtension: () => undefined },
     commands: {
@@ -78,6 +87,8 @@ async function harness(snapshots = [snapshot('selected')]) {
       showInformationMessage: async (message: string) => { state.messages.push(message); },
       showErrorMessage: async (message: string) => { state.errors.push(message); },
       showWarningMessage: async (message: string) => { state.warnings.push(message); return state.warningChoice; },
+      showInputBox: async () => state.input,
+      withProgress: async (_options: unknown, task: () => Promise<unknown>) => task(),
       showQuickPick: async (items: { label: string; detail?: string }[]) => {
         state.pickItems.push(items); const picked = state.picks.shift(); return typeof picked === 'function' ? picked() : picked;
       },
@@ -94,10 +105,12 @@ async function harness(snapshots = [snapshot('selected')]) {
   runInNewContext(readFileSync(filename, 'utf8'), {
     exports: module.exports, module, __dirname: path.dirname(filename), __filename: filename, Error,
     require: (id: string) => id === 'vscode' ? mockVscode : id === './bridge' ? { PythonBridge: Bridge }
-      : id === './documents' ? { ReviewDocuments: class {} } : id === './timelineView' ? viewModule.exports : localRequire(id),
+      : id === './documents' ? { ReviewDocuments: class { async text(_title: string, value: string) { state.documents.push(value); } } } : id === './timelineView' ? viewModule.exports : localRequire(id),
     process, setTimeout, clearTimeout,
   }, { filename });
-  assert.equal((await module.exports.activate({ subscriptions: [], globalStorageUri: { fsPath: 'C:/storage' }, extensionPath: '.', extensionMode: 1 })).ready, true);
+  assert.equal((await module.exports.activate({ subscriptions: [], globalStorageUri: { fsPath: 'C:/storage' }, extensionPath: '.', extensionMode: 1,
+    workspaceState: { get: (key: string, fallback: unknown) => workspaceValues.get(key) ?? fallback, update: async (key: string, value: unknown) => { workspaceValues.set(key, value); } },
+  })).ready, true);
   return {
     state, repo, stop: async () => { webviewProvider.dispose(); await module.exports.deactivate(); },
     children: async (item?: vscode.TreeItem) => (await provider!.getChildren(item)) || [],
@@ -235,4 +248,82 @@ test('webview serializes host data safely, lazily loads files and only runs allo
   await h.message({ type: 'action', id: record.id, action: 'deleteSnapshot' });
   assert.equal(h.state.warnings.length, 1);
   assert.equal(h.state.calls.filter(c => c.method === 'deleteSnapshot').length, 0, 'Modal cancellation must still preserve history');
+});
+
+function changed(path: string): Change {
+  return { path, kind: 'added', before: { state: 'absent' }, after: { state: 'present', hash: '', size: 1, executable: false } };
+}
+
+test('commit file toggles include earlier pending docs and persist across refresh and restart', async t => {
+  const records = [snapshot('selected', { boundaryState: 'ready' })];
+  const saved = new Map<string, unknown>();
+  const h = await harness(records, saved); t.after(h.stop);
+  h.state.changes = [changed('app.py')]; h.state.commitChanges = [changed('app.py'), changed('docs/guide.md')];
+  const [repo] = await h.children(); const [record] = await h.children(repo);
+  let files = await h.children(record);
+  const docs = files.find(f => f.label === 'guide.md')! as vscode.TreeItem & { commitIncluded: boolean; commitOnly: boolean };
+  assert.equal(docs.commitIncluded, true); assert.equal(docs.commitOnly, true);
+  await h.command('devSnapshot.toggleCommitFile', docs);
+  files = await h.children(record);
+  assert.equal((files.find(f => f.label === 'guide.md') as typeof docs).commitIncluded, false);
+  assert.equal(h.state.calls.filter(c => c.method === 'commitPrepare').length, 0);
+  const reopened = await harness(records, saved); t.after(reopened.stop);
+  reopened.state.changes = h.state.changes; reopened.state.commitChanges = h.state.commitChanges;
+  const [reopenedRepo] = await reopened.children(); const [reopenedRecord] = await reopened.children(reopenedRepo);
+  const reopenedDocs = (await reopened.children(reopenedRecord)).find(f => f.label === 'guide.md') as typeof docs;
+  assert.equal(reopenedDocs.commitIncluded, false);
+  await reopened.command('devSnapshot.toggleCommitFile', reopenedDocs);
+  assert.equal(((await reopened.children(reopenedRecord)).find(f => f.label === 'guide.md') as typeof docs).commitIncluded, true);
+});
+
+test('commit confirmation sends exactly included files and identifies omitted docs', async t => {
+  const h = await harness([snapshot('selected', { boundaryState: 'ready' })]); t.after(h.stop);
+  h.state.changes = [changed('app.py'), changed('guide.md')];
+  const [repo] = await h.children(); const [record] = await h.children(repo);
+  const docs = (await h.children(record)).find(f => f.label === 'guide.md')!;
+  await h.command('devSnapshot.toggleCommitFile', docs);
+  h.state.input = 'feat: app only'; h.state.warningChoice = '승인'; h.state.picks = [{ label: '검토 완료' }];
+  await h.command('devSnapshot.prepareCommit', record);
+  assert.deepEqual(h.state.errors, []);
+  const prepared = h.state.calls.find(c => c.method === 'commitPrepare')!;
+  assert.deepEqual(Array.from(prepared.params.selected as string[]), ['app.py']);
+  assert.equal(prepared.params.reviewHash, 'review/app.py');
+  assert.equal(prepared.params.approved, true);
+  assert.match(h.state.documents[0]!, /이번 커밋에서 제외: 1개 파일\nguide.md/);
+  assert.match(h.state.warnings.at(-1)!, /선택한 파일 1개/);
+  assert.equal(h.state.calls.filter(c => c.method === 'commitExecute').length, 1);
+});
+
+test('empty selection and cancelled approval never prepare or execute a commit', async t => {
+  const h = await harness([snapshot('selected', { boundaryState: 'ready' })]); t.after(h.stop);
+  h.state.changes = [changed('guide.md')];
+  const [repo] = await h.children(); const [record] = await h.children(repo);
+  let docs = (await h.children(record)).find(f => f.label === 'guide.md')!;
+  await h.command('devSnapshot.toggleCommitFile', docs);
+  await h.command('devSnapshot.prepareCommit', record);
+  assert.match(h.state.messages.at(-1)!, /포함할 파일이 없습니다/);
+  docs = (await h.children(record)).find(f => f.label === 'guide.md')!;
+  await h.command('devSnapshot.toggleCommitFile', docs);
+  h.state.input = 'docs: guide';
+  await h.command('devSnapshot.prepareCommit', record);
+  assert.equal(h.state.calls.filter(c => ['commitPrepare', 'commitExecute'].includes(c.method)).length, 0);
+});
+
+test('webview commit toggle uses owned file path and refuses read-only changes', async t => {
+  const h = await harness([snapshot('selected', { boundaryState: 'partial' })]); t.after(h.stop);
+  h.state.changes = [changed('guide.md')]; h.openView();
+  await h.message({ type: 'ready' });
+  const record = h.viewMessages.find(m => m.type === 'state')!.repositories[0].children[0];
+  assert.equal(record.partial, true);
+  await h.message({ type: 'expand', id: record.id });
+  const file = h.viewMessages.find(m => m.type === 'children')!.children.find((c: { kind: string }) => c.kind === 'file');
+  assert.equal(file.commitIncluded, true);
+  await h.message({ type: 'action', id: file.id, action: 'toggleCommitFile', path: '../../outside' });
+  const saved = h.state.workspaceValues.get('commitExclusions') as Record<string, string[]>;
+  assert.deepEqual(Array.from(saved['repo/selected']!), ['guide.md']);
+  h.repo.writable = false;
+  const [repo] = await h.children(); const [readonlyRecord] = await h.children(repo);
+  const readonlyDocs = (await h.children(readonlyRecord)).find(f => f.label === 'guide.md');
+  await h.command('devSnapshot.toggleCommitFile', readonlyDocs);
+  assert.deepEqual(Array.from((h.state.workspaceValues.get('commitExclusions') as typeof saved)['repo/selected']!), ['guide.md']);
 });

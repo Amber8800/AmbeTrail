@@ -962,6 +962,116 @@ service.apply(service.prepare(sys.argv[4])['id'])
         with self.assertRaises(SafetyError):
             service.prepare_boundary(snapshots[1]["id"])
 
+    def test_boundary_selected_code_then_docs_from_same_snapshot_survive_restart(self):
+        self.write("a.txt", b"selected code")
+        self.write("guide.md", b"selected docs")
+        selected = self.core.capture()
+        self.write("a.txt", b"newer local code")
+        self.write("guide.md", b"newer local docs")
+        self.core.capture()
+        engine, session = Engine(), Session(self.git, self.store, self.config)
+        engine.sessions[self.identity["id"]] = session
+        self.addCleanup(engine.close)
+        params = {"repositoryId": self.identity["id"], "snapshotId": selected["id"]}
+        review = engine.call("commitBoundaryReview", {**params, "selected": ["a.txt"]})
+        self.assertEqual([c["path"] for c in review["omitted"]], ["guide.md"])
+        prepared = engine.call("commitPrepare", {**params, "selected": ["a.txt"], "reviewHash": review["reviewHash"], "approved": True})
+        self.assertEqual(prepared["selected"], ["a.txt"])
+        first = engine.call("commitExecute", {"repositoryId": self.identity["id"], "operationId": prepared["id"], "message": "feat: code only", "approved": True})
+        self.assertTrue(first["expected"])
+        self.assertTrue(first["partial"])
+        self.assertNotIn("cleanup", first, "Incomplete snapshots must not offer history cleanup")
+        self.assertEqual(self.git.file_content("a.txt", head=first["oid"]), b"selected code")
+        self.assertIsNone(self.git.file_content("guide.md", head=first["oid"]))
+        timeline = {s["id"]: s for s in session.timeline()}
+        self.assertEqual(timeline[selected["id"]]["boundaryState"], "partial")
+        self.assertEqual(timeline[selected["id"]]["commitChangedFiles"], 1)
+        # Reopen application state, then commit the remaining documentation at the same boundary.
+        session = Session(self.git, self.store, self.config)
+        engine.sessions[self.identity["id"]] = session
+        self.store.gc()
+        remaining = engine.call("commitBoundaryReview", params)
+        self.assertEqual([c["path"] for c in remaining["changes"]], ["guide.md"])
+        prepared = engine.call("commitPrepare", {**params, "selected": ["guide.md"], "reviewHash": remaining["reviewHash"], "approved": True})
+        second = engine.call("commitExecute", {"repositoryId": self.identity["id"], "operationId": prepared["id"], "message": "docs: guide", "approved": True})
+        self.assertTrue(second["expected"])
+        self.assertFalse(second.get("partial"))
+        self.assertIn("cleanup", second)
+        self.assertEqual(self.git.file_content("a.txt", head=second["oid"]), b"selected code")
+        self.assertEqual(self.git.file_content("guide.md", head=second["oid"]), b"selected docs")
+        self.assertEqual((self.root / "a.txt").read_bytes(), b"newer local code")
+        self.assertEqual((self.root / "guide.md").read_bytes(), b"newer local docs")
+        self.assertTrue(self.git.clean_index())
+        self.assertEqual(next(s for s in session.timeline() if s["id"] == selected["id"])["boundaryState"], "committed")
+
+    def test_boundary_selected_deletion_leaves_other_files_for_later_commit(self):
+        from dev_snapshot.boundary import BoundaryCommitService
+        (self.root / "a.txt").rename(self.root / "renamed.txt")
+        self.write("guide.md", b"docs later")
+        snapshot = self.core.capture()
+        service = BoundaryCommitService(self.core)
+        first = service.execute(service.prepare_boundary(snapshot["id"], selected=["a.txt"]), "chore: remove old path", [])
+        self.assertTrue(first["partial"])
+        self.assertIsNone(self.git.file_content("a.txt", head=first["oid"]))
+        self.assertIsNone(self.git.file_content("renamed.txt", head=first["oid"]))
+        self.assertEqual({c["path"] for c in service.review(snapshot["id"])["changes"]}, {"guide.md", "renamed.txt"})
+        final = service.execute(service.prepare_boundary(snapshot["id"]), "chore: remaining files", [])
+        self.assertTrue(final["expected"])
+        self.assertEqual(self.git.file_content("renamed.txt", head=final["oid"]), b"baseline\r\n")
+        self.assertEqual(self.git.file_content("guide.md", head=final["oid"]), b"docs later")
+
+    def test_boundary_selection_rejects_unavailable_empty_and_changed_reviews(self):
+        service, snapshots = self.boundary_fixture()
+        target = snapshots[1]["id"]
+        before = self.git.context(), self.git.index_bytes()
+        for selected in (["b.txt"], ["a.txt", "a.txt"], ["../outside"], "a.txt", []):
+            with self.assertRaises(SafetyError):
+                service.prepare_boundary(target, selected=selected)
+        review = service.review(target, selected=["a.txt"])
+        with self.assertRaisesRegex(SafetyError, "changed after review"):
+            service.prepare_boundary(target, selected=["a.txt"], review_hash="stale")
+        prepared = service.prepare_boundary(target, selected=["a.txt"], review_hash=review["reviewHash"])
+        service.cancel(prepared)
+        self.assertEqual((self.git.context(), self.git.index_bytes()), before)
+        self.assertEqual((self.root / "a.txt").read_bytes(), b"work 5")
+
+    def test_boundary_partial_filter_baselines_survive_gc_and_later_snapshots(self):
+        from dev_snapshot.boundary import BoundaryCommitService
+        self.write(".gitattributes", b"*.txt text eol=lf\n")
+        self.git.add([".gitattributes"])
+        self.git.run("commit", "-m", "configure line endings")
+        self.core.capture()
+        self.write("a.txt", b"first\r\ncode\r\n")
+        self.write("b.txt", b"second\r\n")  # A selected file with no change after Git normalization.
+        self.write("guide.md", b"docs pending")
+        first = self.core.capture()
+        service = BoundaryCommitService(self.core)
+        code = service.execute(service.prepare_boundary(first["id"], selected=["a.txt", "b.txt"]), "feat: first code", [])
+        self.assertEqual(self.git.file_content("a.txt", head=code["oid"]), b"first\ncode\n")
+        self.assertEqual([c["path"] for c in service.review(first["id"])["changes"]], ["guide.md"])
+        first_hash = first["entries"]["a.txt"]["hash"]
+        self.write("a.txt", b"second\r\ncode\r\n")
+        self.write("b.txt", b"another feature\r\n")
+        later = self.core.capture()
+        service.execute(service.prepare_boundary(later["id"], selected=["b.txt"]), "feat: b only", [])
+        self.store.delete_snapshot(first["id"])
+        # Remove completed-operation backups to leave only the partial receipt owning the old raw bytes.
+        for snapshot in self.store.snapshots():
+            if snapshot["reason"] == "backup":
+                self.store.update_metadata(snapshot["id"], protectedUntil="")
+                self.store.delete_snapshot(snapshot["id"])
+        self.store.gc()
+        self.assertEqual(self.store.get(first_hash), b"first\r\ncode\r\n")
+        service = BoundaryCommitService(self.core)
+        self.assertEqual({c["path"] for c in service.review(later["id"])["changes"]}, {"a.txt", "guide.md"})
+        service.execute(service.prepare_boundary(later["id"], selected=["a.txt"]), "feat: second code", [])
+        self.store.gc()
+        self.assertFalse(self.store._object(first_hash).exists(), "Superseded partial receipts must not leak old objects")
+        self.assertEqual([c["path"] for c in service.review(later["id"])["changes"]], ["guide.md"])
+        docs = service.execute(service.prepare_boundary(later["id"]), "docs: separate guide", [])
+        self.assertTrue(docs["expected"])
+        self.assertEqual(self.git.file_content("guide.md", head=docs["oid"]), b"docs pending")
+
     def test_boundary_cancel_leaves_real_git_state_untouched(self):
         service, snapshots = self.boundary_fixture()
         before = self.git.context(), self.git.index_bytes()

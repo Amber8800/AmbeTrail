@@ -59,12 +59,30 @@
       const retry = element('button', 'secondary', '다시 불러오기'); retry.onclick = () => send('expand', snapshot.id); files.append(retry); return;
     }
     const changes = items.filter(item => item.kind === 'file');
+    for (const warning of items.filter(item => item.description === 'commit-warning')) files.append(element('p', 'hint', warning.label));
+    const selectable = changes.filter(item => typeof item.commitIncluded === 'boolean');
+    if (selectable.length) files.append(element('p', 'hint selection-summary', `커밋 포함 ${selectable.filter(item => item.commitIncluded).length}개 · 제외 ${selectable.filter(item => !item.commitIncluded).length}개 · − 제외 / + 포함`));
     if (!changes.length) files.append(element('p', 'hint', '이번 기록에 변경된 파일이 없습니다.'));
     for (const item of changes) {
+      const row = element('div', `file-row${item.commitIncluded === false ? ' commit-excluded' : ''}`);
       const file = button('', 'openDiff', item, `file ${item.change}`);
       file.title = item.path;
-      file.append(element('span', 'file-name', item.path), element('span', 'file-kind', item.change === 'added' ? '추가' : item.change === 'deleted' ? '삭제' : '수정'));
-      files.append(file);
+      file.setAttribute('aria-label', `${item.path} 변경 비교`);
+      file.append(element('span', 'file-name', item.label), element('span', 'file-kind', item.change === 'added' ? '추가' : item.change === 'deleted' ? '삭제' : '수정'));
+      if (item.commitOnly || item.commitIncluded === false) {
+        const notes = element('span', 'file-notes');
+        if (item.commitOnly) notes.append(element('span', 'file-note', '이전 기록'));
+        if (item.commitIncluded === false) notes.append(element('span', 'file-note', '커밋 제외'));
+        file.append(notes);
+      }
+      row.append(file);
+      if (typeof item.commitIncluded === 'boolean') {
+        const toggle = button(item.commitIncluded ? '−' : '+', 'toggleCommitFile', item, 'file-include');
+        toggle.title = `${item.path} · ${item.commitIncluded ? '이번 커밋에서 제외' : '이번 커밋에 포함'}`;
+        toggle.setAttribute('aria-label', toggle.title); toggle.setAttribute('aria-pressed', String(item.commitIncluded));
+        row.append(toggle);
+      }
+      files.append(row);
     }
   }
   function record(snapshot, repo) {
@@ -79,6 +97,7 @@
     meta.append(element('span', 'branch-tag', snapshot.branch), element('span', '', `파일 ${snapshot.changedFiles}개`));
     if (snapshot.pinned) meta.append(element('span', 'badge', '고정'));
     if (snapshot.committed) meta.append(element('span', 'badge', '커밋됨'));
+    else if (snapshot.partial) meta.append(element('span', 'badge', '일부 커밋'));
     const disclosure = element('span', 'disclosure'); disclosure.append(element('span', 'closed-label', '펼치기'), element('span', 'open-label', '접기')); meta.append(disclosure);
     summary.append(heading, meta); details.append(summary);
     const body = element('div', 'details-body');

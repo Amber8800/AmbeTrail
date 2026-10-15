@@ -51,7 +51,7 @@ class CommitService:
         for name in selected:
             entries[name] = self.core.read_entry(name, policy)
             if entries[name]["state"] == "excluded":
-                raise SafetyError("Excluded files cannot be committed through Amberog.")
+                raise SafetyError("Excluded files cannot be committed through AmberTrail.")
         backup = self.core.backup(entries, context)
         original_index = git.index_bytes()
         journal = {"schema": 1, "id": new_id(), "kind": "commit", "phase": "prepared", "createdAt": utc_now(),

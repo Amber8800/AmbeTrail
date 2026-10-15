@@ -61,10 +61,17 @@ details[open] > summary .open-label { display: inline; }
 code { font: 10px var(--vscode-editor-font-family, monospace); }
 .actions { display: flex; flex-wrap: wrap; gap: 5px; margin: 10px 0; }
 .actions button { font-size: 11px; padding: 4px 9px; }
-.files { display: grid; gap: 1px; }
-.file { display: flex; align-items: center; gap: 7px; width: 100%; padding: 5px 3px; font-size: 11px; text-align: left; }
-.file-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.file-kind { font-size: 9px; padding: 0 3px; border: 1px solid currentColor; border-radius: 3px; }
+.files { display: grid; grid-template-columns: minmax(0, 1fr); min-width: 0; gap: 1px; }
+.file { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 2px 7px; min-width: 0; width: 100%; padding: 5px 3px; font-size: 11px; text-align: left; }
+.file-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-row { display: grid; grid-template-columns: minmax(0, 1fr) 27px; min-width: 0; align-items: center; gap: 4px; }
+.file-include { flex: none; width: 27px; padding: 2px 0; font-size: 17px; border-color: var(--vscode-panel-border); color: var(--vscode-textLink-foreground); }
+.file-include[aria-pressed="true"] { color: var(--vscode-descriptionForeground); }
+.commit-excluded .file-name { color: var(--vscode-descriptionForeground); }
+.file-note { flex: none; font-size: 9px; color: var(--vscode-descriptionForeground); }
+.file-notes { grid-column: 1 / -1; display: flex; flex-wrap: wrap; min-width: 0; gap: 6px; white-space: normal; }
+.selection-summary { margin-bottom: 5px; }
+.file-kind { justify-self: end; font-size: 9px; padding: 0 3px; border: 1px solid currentColor; border-radius: 3px; }
 .added .file-kind { color: var(--vscode-gitDecoration-addedResourceForeground); }
 .deleted .file-kind { color: var(--vscode-gitDecoration-deletedResourceForeground); }
 .modified .file-kind { color: var(--vscode-gitDecoration-modifiedResourceForeground); }

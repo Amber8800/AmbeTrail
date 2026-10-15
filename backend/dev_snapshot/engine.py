@@ -197,10 +197,10 @@ class Session:
                     self.work_summaries[key] = snapshot_summary(self.snapshot_changes(s["id"]))
                 summary = self.work_summaries[key]
             if baseline is not None and s["context"]["branch"] == context["branch"]:
-                if anchor and s["endedAt"] <= anchor["boundaryAt"]:
+                if anchor and (s["endedAt"] < anchor["boundaryAt"] or s["endedAt"] == anchor["boundaryAt"] and not anchor.get("partial")):
                     boundary_state = "committed"
                 elif s["context"]["head"] in ([context["head"]] + (anchor["sourceHeads"] if anchor else [])):
-                    boundary_state = "ready"
+                    boundary_state = "partial" if anchor and anchor.get("partial") and s["id"] == anchor["snapshotIds"][0] else "ready"
                     key = (s["id"], context["head"])
                     if key not in self.interval_summaries:
                         changes = changes_between(baseline, self.store.snapshot(s["id"])["entries"])
@@ -259,6 +259,13 @@ class Session:
         elif kind == "boundaryStaged":
             journal = Engine._journal(self, params["operationId"])
             before, after = self.commits.diff(journal, name)
+        elif kind == "boundary":
+            review = self.commits.review(params["snapshotId"])
+            change = next((c for c in review["changes"] if c["path"] == name), None)
+            if not change:
+                raise SafetyError("File is outside the current snapshot commit scope.")
+            before = self.git.file_content(name, head=review["context"]["head"])
+            after = self.entry_content(change["after"])
         elif kind in ("current", "staged"):
             if Policy(self.core).exclusion(name):
                 raise SafetyError("Excluded files cannot be previewed.")
@@ -425,14 +432,14 @@ class Engine:
         elif method == "commitChoices":
             return session.commits.choices()
         elif method == "commitBoundaryReview":
-            return session.commits.review(params["snapshotId"])
+            return session.commits.review(params["snapshotId"], selected=params.get("selected"))
         elif method == "commitPrepare":
             self._approved(params)
-            result = session.commits.prepare_boundary(params["snapshotId"]) if params.get("snapshotId") else session.commits.prepare(params["selected"])
+            result = session.commits.prepare_boundary(params["snapshotId"], selected=params.get("selected"), review_hash=params.get("reviewHash")) if params.get("snapshotId") else session.commits.prepare(params["selected"])
         elif method == "commitExecute":
             self._approved(params)
             result = session.commits.execute(self._journal(session, params["operationId"]), params["message"], params.get("snapshotIds", []))
-            if result["expected"] and result["snapshotIds"]:
+            if result["expected"] and result["snapshotIds"] and not result.get("partial"):
                 try:
                     review = store.history_before(result["snapshotIds"][0])
                     token = new_id()

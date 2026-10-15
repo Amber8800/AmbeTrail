@@ -3,7 +3,7 @@ import pathlib
 import sys
 
 if sys.version_info < (3, 12):
-    sys.stderr.write("Amberog requires Python 3.12 or newer.\n")
+    sys.stderr.write("AmberTrail requires Python 3.12 or newer.\n")
     raise SystemExit(1)
 
 # Isolated mode excludes the working directory, PYTHONPATH, and user site packages.
