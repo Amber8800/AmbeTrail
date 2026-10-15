@@ -301,7 +301,7 @@ class Engine:
 
     def call(self, method: str, params: dict) -> object:
         if method == "hello":
-            return {"protocol": 1, "version": "0.1.4", "python": os.sys.version.split()[0]}
+            return {"protocol": 1, "version": "0.2.0", "python": os.sys.version.split()[0]}
         if method == "open":
             config = settings_from(params.get("settings"))
             git = Git(Path(params["root"]).resolve(strict=True), params.get("gitPath", "git"))

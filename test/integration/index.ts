@@ -17,14 +17,12 @@ async function scenario(): Promise<void> {
   const commands = await vscode.commands.getCommands(true);
   for (const name of ['captureNow', 'openDiff', 'restoreSnapshot', 'undoRestore', 'prepareCommit', 'renameSnapshot', 'deleteSnapshot', 'push', 'recover']) assert.ok(commands.includes(`devSnapshot.${name}`));
   const contributions = extension.packageJSON.contributes;
+  assert.equal(contributions.views.devSnapshot.find((view: { id: string }) => view.id === 'devSnapshot.timeline').type, 'webview');
+  await vscode.commands.executeCommand('devSnapshot.timeline.focus');
   const commitCommand = contributions.commands.find((item: { command: string }) => item.command === 'devSnapshot.prepareCommit');
   assert.equal(commitCommand.icon, '$(git-commit)');
-  assert.ok(contributions.menus['view/item/context'].some((item: { command: string; group: string }) => item.command === 'devSnapshot.prepareCommit' && item.group.startsWith('inline')));
   const deleteCommand = contributions.commands.find((item: { command: string }) => item.command === 'devSnapshot.deleteSnapshot');
   assert.equal(deleteCommand.icon, '$(trash)');
-  const deleteMenus = contributions.menus['view/item/context'].filter((item: { command: string }) => item.command === 'devSnapshot.deleteSnapshot');
-  assert.ok(deleteMenus.some((item: { group: string }) => item.group.startsWith('inline')));
-  assert.ok(deleteMenus.some((item: { group: string }) => !item.group.startsWith('inline')));
   const repo = process.env.DEV_SNAPSHOT_TEST_REPO!;
   for (let attempt = 0; attempt < 100; attempt++) {
     const status = await vscode.commands.executeCommand<unknown[]>('devSnapshot.refresh');

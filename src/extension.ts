@@ -3,6 +3,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { PythonBridge } from './bridge';
 import { ReviewDocuments } from './documents';
+import { TimelineView } from './timelineView';
 import { branchColor, branchLabel, compactTime, repositoryStatus, snapshotContext, workTitle } from './presentation';
 import { BoundaryReview, CaptureJob, Change, Diff, GitContext, Journal, PushReview, Receipt, Repository, RestorePlan, SnapshotItem } from './protocol';
 
@@ -109,7 +110,8 @@ class Application {
   private errorShown = new Set<string>();
   constructor(readonly context: vscode.ExtensionContext, readonly bridge: PythonBridge) {}
   async start(): Promise<void> {
-    this.context.subscriptions.push(vscode.window.registerTreeDataProvider('devSnapshot.timeline', this.timeline), vscode.workspace.registerTextDocumentContentProvider('dev-snapshot', this.documents));
+    const view = new TimelineView(this.timeline, this.context.extensionUri);
+    this.context.subscriptions.push(view, vscode.window.registerWebviewViewProvider('devSnapshot.timeline', view), vscode.workspace.registerTextDocumentContentProvider('dev-snapshot', this.documents));
     this.commands();
     this.bridge.on('changed', () => this.scheduleRefresh());
     this.bridge.on('failure', (error: Error) => { this.status = error.message; this.timeline.refresh(); void vscode.window.showErrorMessage(error.message); });

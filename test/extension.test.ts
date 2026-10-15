@@ -25,6 +25,15 @@ async function harness(snapshots = [snapshot('selected')]) {
     picks: [] as unknown[], pickItems: [] as { label: string; detail?: string }[][], deleteError: undefined as Error | undefined,
   };
   let provider: vscode.TreeDataProvider<vscode.TreeItem> | undefined;
+  let webviewProvider: { source: typeof provider; resolveWebviewView(view: unknown): void; dispose(): void };
+  let receiveMessage: (message: unknown) => void;
+  const viewMessages: Record<string, any>[] = [];
+  const webview = {
+    html: '', options: {}, cspSource: 'vscode-webview://fixture',
+    asWebviewUri: (uri: unknown) => String(uri),
+    onDidReceiveMessage: (listener: typeof receiveMessage) => { receiveMessage = listener; return disposable; },
+    postMessage: async (message: Record<string, any>) => { viewMessages.push(message); return true; },
+  };
   const commands = new Map<string, (item?: vscode.TreeItem) => Promise<unknown>>();
   const disposable = { dispose() {} };
   const event = () => disposable;
@@ -53,15 +62,19 @@ async function harness(snapshots = [snapshot('selected')]) {
     ThemeColor: class { constructor(public id: string) {} },
     EventEmitter: class { event = event; fire() {} },
     UIKind: { Desktop: 1 }, ExtensionMode: { Development: 2 }, env: { uiKind: 1 },
+    Uri: { joinPath: (_base: unknown, ...parts: string[]) => parts.join('/') },
     extensions: { getExtension: () => undefined },
-    commands: { registerCommand: (id: string, action: (item?: vscode.TreeItem) => Promise<unknown>) => { commands.set(id, action); return disposable; } },
+    commands: {
+      registerCommand: (id: string, action: (item?: vscode.TreeItem) => Promise<unknown>) => { commands.set(id, action); return disposable; },
+      executeCommand: async (id: string, item?: vscode.TreeItem) => commands.get(id)?.(item),
+    },
     workspace: {
       isTrusted: true, workspaceFolders: [], textDocuments: [],
       getConfiguration: () => ({ inspect: () => undefined }), registerTextDocumentContentProvider: event,
       onDidSaveTextDocument: event, onDidChangeTextDocument: event, onDidCloseTextDocument: event, onDidChangeConfiguration: event,
     },
     window: {
-      registerTreeDataProvider: (_id: string, value: typeof provider) => { provider = value; return disposable; },
+      registerWebviewViewProvider: (_id: string, value: typeof webviewProvider) => { webviewProvider = value; provider = value.source; return disposable; },
       showInformationMessage: async (message: string) => { state.messages.push(message); },
       showErrorMessage: async (message: string) => { state.errors.push(message); },
       showWarningMessage: async (message: string) => { state.warnings.push(message); return state.warningChoice; },
@@ -72,18 +85,26 @@ async function harness(snapshots = [snapshot('selected')]) {
   };
   const filename = path.resolve(__dirname, '../src/extension.js');
   const localRequire = createRequire(filename);
+  const viewModule = { exports: {} };
+  runInNewContext(readFileSync(path.join(path.dirname(filename), 'timelineView.js'), 'utf8'), {
+    exports: viewModule.exports, module: viewModule,
+    require: (id: string) => id === 'vscode' ? mockVscode : localRequire(id), Error, setTimeout, clearTimeout,
+  });
   const module = { exports: {} as { activate: (ctx: unknown) => Promise<{ ready: boolean }>; deactivate: () => Promise<void> } };
   runInNewContext(readFileSync(filename, 'utf8'), {
     exports: module.exports, module, __dirname: path.dirname(filename), __filename: filename, Error,
     require: (id: string) => id === 'vscode' ? mockVscode : id === './bridge' ? { PythonBridge: Bridge }
-      : id === './documents' ? { ReviewDocuments: class {} } : localRequire(id),
+      : id === './documents' ? { ReviewDocuments: class {} } : id === './timelineView' ? viewModule.exports : localRequire(id),
     process, setTimeout, clearTimeout,
   }, { filename });
   assert.equal((await module.exports.activate({ subscriptions: [], globalStorageUri: { fsPath: 'C:/storage' }, extensionPath: '.', extensionMode: 1 })).ready, true);
   return {
-    state, repo, stop: module.exports.deactivate,
+    state, repo, stop: async () => { webviewProvider.dispose(); await module.exports.deactivate(); },
     children: async (item?: vscode.TreeItem) => (await provider!.getChildren(item)) || [],
     command: async (id: string, item?: vscode.TreeItem) => { assert.ok(commands.has(id)); await commands.get(id)!(item); },
+    webview, viewMessages,
+    openView: () => webviewProvider.resolveWebviewView({ webview, visible: true, onDidChangeVisibility: event, onDidDispose: event }),
+    message: async (message: unknown) => { receiveMessage(message); await new Promise(resolve => setImmediate(resolve)); },
   };
 }
 
@@ -191,4 +212,27 @@ test('history management stops if the selected record becomes protected while th
   assert.match(h.state.messages.at(-1)!, /보호된 기록/);
   assert.equal(h.state.warnings.length, 0);
   assert.equal(h.state.calls.filter(c => c.method === 'deleteSnapshot').length, 0);
+});
+
+test('webview serializes host data safely, lazily loads files and only runs allowed actions on known IDs', async t => {
+  const h = await harness([snapshot('selected', { metadata: { pinned: false, validation: 'unverified', commitIds: [], title: '<script>unsafe</script>' } })]); t.after(h.stop);
+  h.openView();
+  assert.match(h.webview.html, /default-src 'none'/);
+  assert.doesNotMatch(h.webview.html, /<script>unsafe/);
+  await h.message({ type: 'ready' });
+  const state = h.viewMessages.find(m => m.type === 'state')!;
+  const record = state.repositories[0].children[0];
+  assert.equal(record.label, '<script>unsafe</script>');
+  assert.equal(record.branch, 'main');
+  assert.equal(h.state.calls.filter(c => c.method === 'snapshotChanges').length, 0);
+  h.state.changes = [{ path: 'a.txt', kind: 'modified', before: { state: 'absent' }, after: { state: 'absent' } }];
+  await h.message({ type: 'expand', id: record.id });
+  const files = h.viewMessages.find(m => m.type === 'children')!.children;
+  assert.equal(files.find((f: { kind: string }) => f.kind === 'file').path, 'a.txt');
+  for (const message of [null, { type: 'action', id: 'forged', action: 'deleteSnapshot' },
+    { type: 'action', id: record.id, action: 'push' }, { type: 'action', id: files[1].id, action: 'deleteSnapshot' }]) await h.message(message);
+  assert.equal(h.state.warnings.length, 0);
+  await h.message({ type: 'action', id: record.id, action: 'deleteSnapshot' });
+  assert.equal(h.state.warnings.length, 1);
+  assert.equal(h.state.calls.filter(c => c.method === 'deleteSnapshot').length, 0, 'Modal cancellation must still preserve history');
 });

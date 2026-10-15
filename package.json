@@ -2,7 +2,7 @@
   "name": "dev-snapshot",
   "displayName": "Amberog",
   "description": "Private local development snapshots with reviewed restore and Git commits.",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "publisher": "dev-snapshot",
   "license": "MIT",
   "engines": { "vscode": "^1.95.0" },
@@ -16,7 +16,7 @@
   },
   "contributes": {
     "viewsContainers": { "activitybar": [{ "id": "devSnapshot", "title": "Amberog", "icon": "media/snapshot.svg" }] },
-    "views": { "devSnapshot": [{ "id": "devSnapshot.timeline", "name": "작업 기록" }] },
+    "views": { "devSnapshot": [{ "id": "devSnapshot.timeline", "name": "작업 기록", "type": "webview" }] },
     "commands": [
       { "command": "devSnapshot.captureNow", "title": "Amberog: Capture Now", "icon": "$(add)" },
       { "command": "devSnapshot.refresh", "title": "Amberog: Refresh", "icon": "$(refresh)" },
@@ -33,20 +33,6 @@
       { "command": "devSnapshot.manageHistory", "title": "Amberog: Manage History" },
       { "command": "devSnapshot.recover", "title": "Amberog: Review Recovery" }
     ],
-    "menus": {
-      "view/title": [
-        { "command": "devSnapshot.captureNow", "when": "view == devSnapshot.timeline", "group": "navigation" },
-        { "command": "devSnapshot.refresh", "when": "view == devSnapshot.timeline", "group": "navigation" }
-      ],
-      "view/item/context": [
-        { "command": "devSnapshot.prepareCommit", "when": "view == devSnapshot.timeline && viewItem == snapshot", "group": "inline@1" },
-        { "command": "devSnapshot.restoreSnapshot", "when": "view == devSnapshot.timeline && viewItem == snapshot", "group": "inline@2" },
-        { "command": "devSnapshot.deleteSnapshot", "when": "view == devSnapshot.timeline && viewItem == snapshot", "group": "inline@3" },
-        { "command": "devSnapshot.renameSnapshot", "when": "view == devSnapshot.timeline && viewItem == snapshot", "group": "edit@1" },
-        { "command": "devSnapshot.pinSnapshot", "when": "view == devSnapshot.timeline && viewItem == snapshot", "group": "edit@2" },
-        { "command": "devSnapshot.deleteSnapshot", "when": "view == devSnapshot.timeline && viewItem == snapshot", "group": "edit@3" }
-      ]
-    },
     "configuration": {
       "title": "Amberog",
       "properties": {
@@ -73,7 +59,7 @@
     "test:bridge": "npm run compile:test && node --test out/test/bridge.test.js out/test/extension.test.js",
     "test:integration": "npm run build && npm run compile:test && node out/test/runIntegration.js",
     "benchmark": "node scripts/python.mjs backend/benchmark.py",
-    "package": "npm run build && vsce package --out amberog-0.1.4.vsix",
+    "package": "npm run build && vsce package --out amberog-0.2.0.vsix",
     "vscode:prepublish": "npm run check && npm run build"
   },
   "dependencies": {},
