@@ -307,6 +307,161 @@ class CoreTests(unittest.TestCase):
         self.assertEqual((self.root / "a.txt").read_bytes(), b"work")
         self.assertEqual((self.root / "newer.txt").read_bytes(), b"keep")
 
+    def test_restore_rechecks_after_loading_replacement_bytes(self):
+        self.write("a.txt", b"reviewed work")
+        restore = RestoreService(self.core)
+        plan = restore.prepare(self.initial["id"])
+        original_write, original_get = restore.files.write, self.store.get
+        changed = False
+        def write_with_race(*args):
+            def read_then_change(object_hash, size=None):
+                nonlocal changed
+                data = original_get(object_hash, size)
+                if not changed:
+                    changed = True
+                    self.write("a.txt", b"external during object read")
+                return data
+            with patch.object(self.store, "get", side_effect=read_then_change):
+                return original_write(*args)
+        with patch.object(restore.files, "write", side_effect=write_with_race):
+            with self.assertRaises(SafetyError):
+                restore.apply(plan["id"])
+        self.assertEqual((self.root / "a.txt").read_bytes(), b"external during object read")
+
+    def test_restore_preserves_actual_file_changed_after_last_comparison(self):
+        self.write("a.txt", b"reviewed work")
+        def fault(phase, name):
+            if phase == "beforeDisplace":
+                self.write(name, b"external in final race window")
+        restore = RestoreService(self.core, fault=fault)
+        plan = restore.prepare(self.initial["id"])
+        with self.assertRaises(SafetyError):
+            restore.apply(plan["id"])
+        journal = self.store.journals()[0]
+        self.assertEqual(journal["phase"], "recoveryRequired")
+        self.assertEqual((self.root / "a.txt").read_bytes(), b"external in final race window")
+        preserved = restore.files.directory(journal["fileMoves"][0])
+        self.assertEqual((preserved / "original").read_bytes(), b"external in final race window")
+        self.assertFalse(any(".dev-snapshot-" in name for name in self.git.files()), "Recovery contents must remain Git-ignored")
+        engine, session = Engine(), Session(self.git, self.store, self.config)
+        engine.sessions[self.identity["id"]] = session
+        self.addCleanup(engine.close)
+        params = {"repositoryId": self.identity["id"], "operationId": journal["id"]}
+        report = engine.call("recoveryReport", params)
+        self.assertEqual(report["preservedFiles"], [{"path": "a.txt", "directory": restore.files.relative_directory(journal["fileMoves"][0])}])
+        destination = self.base / "export"
+        destination.mkdir()
+        with self.assertRaisesRegex(SafetyError, "selected recovery backup"):
+            engine.call("exportBackup", {**params, "snapshotId": self.initial["id"], "destination": str(destination), "approved": True})
+        self.assertEqual(list(destination.iterdir()), [], "Invalid backup selection must not write an export")
+        export = Path(engine.call("exportBackup", {**params, "snapshotId": plan["backupId"], "destination": str(destination), "approved": True}))
+        self.assertIn(b"external in final race window", [p.read_bytes() for p in export.rglob("original")])
+        self.assertIn(b"external in final race window", [p.read_bytes() for p in export.rglob("current")])
+        self.assertTrue(list(export.rglob("manifest.json")))
+        self.assertEqual((export / "a.txt").read_bytes(), b"reviewed work")
+        self.store.snapshot(plan["backupId"], verify=True)
+
+    def test_restore_never_overwrites_a_file_created_in_the_publication_gap(self):
+        self.write("a.txt", b"reviewed work")
+        def fault(phase, name):
+            if phase == "afterDisplace":
+                self.write(name, b"new external file")
+        restore = RestoreService(self.core, fault=fault)
+        plan = restore.prepare(self.initial["id"])
+        with self.assertRaises(SafetyError):
+            restore.apply(plan["id"])
+        self.assertEqual((self.root / "a.txt").read_bytes(), b"new external file")
+        journal = self.store.journals()[0]
+        self.assertEqual(journal["phase"], "recoveryRequired")
+        self.assertEqual((restore.files.directory(journal["fileMoves"][0]) / "original").read_bytes(), b"reviewed work")
+
+    def test_restore_creation_never_overwrites_a_racing_creator(self):
+        (self.root / "a.txt").unlink()
+        self.core.capture()
+        def fault(phase, name):
+            if phase == "afterDisplace":
+                self.write(name, b"external creation")
+        restore = RestoreService(self.core, fault=fault)
+        with self.assertRaises(SafetyError):
+            restore.apply(restore.prepare(self.initial["id"])["id"])
+        self.assertEqual((self.root / "a.txt").read_bytes(), b"external creation")
+
+    def test_restore_deletion_preserves_a_racing_modification(self):
+        self.write("remove.txt", b"reviewed deletion")
+        self.core.capture()
+        def fault(phase, name):
+            if phase == "beforeDisplace" and name == "remove.txt":
+                self.write(name, b"external before deletion")
+        restore = RestoreService(self.core, fault=fault)
+        with self.assertRaises(SafetyError):
+            restore.apply(restore.prepare(self.initial["id"])["id"])
+        self.assertEqual((self.root / "remove.txt").read_bytes(), b"external before deletion")
+
+    def test_restore_preserves_writes_to_a_displaced_inode(self):
+        self.write("a.txt", b"reviewed work")
+        def fault(phase, name):
+            if phase == "afterPublish":
+                journal = self.store.journals()[0]
+                directory = restore.files.directory(journal["fileMoves"][-1])
+                (directory / "original").write_bytes(b"late write through an old handle")
+        restore = RestoreService(self.core, fault=fault)
+        with self.assertRaises(SafetyError):
+            restore.apply(restore.prepare(self.initial["id"])["id"])
+        journal = self.store.journals()[0]
+        self.assertEqual(journal["phase"], "recoveryRequired")
+        directory = restore.files.directory(journal["fileMoves"][0])
+        self.assertEqual((directory / "original").read_bytes(), b"late write through an old handle")
+
+    def test_restore_without_safe_publication_support_leaves_original_untouched(self):
+        self.write("a.txt", b"keep this work")
+        restore = RestoreService(self.core)
+        plan = restore.prepare(self.initial["id"])
+        with patch("dev_snapshot.restore_io.os.link", side_effect=OSError("unsupported")):
+            with self.assertRaisesRegex(SafetyError, "hard-link support"):
+                restore.apply(plan["id"])
+        self.assertEqual((self.root / "a.txt").read_bytes(), b"keep this work")
+        self.assertEqual(self.store.journals()[0]["phase"], "rolledBack")
+        self.assertFalse(list(self.root.glob(".dev-snapshot-*.restore")))
+
+    def test_restore_preserves_a_concurrent_edit_during_rollback(self):
+        self.write("a.txt", b"reviewed work")
+        displacements = 0
+        def fault(phase, name):
+            nonlocal displacements
+            if phase == "beforeDisplace":
+                displacements += 1
+                if displacements == 2:
+                    self.write(name, b"external during rollback")
+            if phase == "afterWrite":
+                raise RuntimeError("start rollback")
+        restore = RestoreService(self.core, fault=fault)
+        with self.assertRaises(RuntimeError):
+            restore.apply(restore.prepare(self.initial["id"])["id"])
+        self.assertEqual((self.root / "a.txt").read_bytes(), b"external during rollback")
+        journal = self.store.journals()[0]
+        self.assertEqual(journal["phase"], "recoveryRequired")
+        originals = [(restore.files.directory(move) / "original").read_bytes() for move in journal["fileMoves"]]
+        self.assertIn(b"reviewed work", originals)
+        self.assertIn(b"external during rollback", originals)
+
+    def test_restore_missing_path_recovery_respects_new_unsaved_edits(self):
+        self.write("a.txt", b"reviewed work")
+        dirty = set()
+        def fault(phase, name):
+            if phase == "afterDisplace":
+                dirty.add(name)
+        restore = RestoreService(self.core, dirty=lambda: dirty, fault=fault)
+        with self.assertRaisesRegex(SafetyError, "unsaved edits"):
+            restore.apply(restore.prepare(self.initial["id"])["id"])
+        journal = self.store.journals()[0]
+        self.assertEqual(journal["phase"], "recoveryRequired")
+        self.assertFalse((self.root / "a.txt").exists(), "Recovery must respect unsaved-document guards")
+        self.assertEqual((restore.files.directory(journal["fileMoves"][0]) / "original").read_bytes(), b"reviewed work")
+        dirty.clear()
+        restore.rollback(journal)
+        self.assertEqual((self.root / "a.txt").read_bytes(), b"reviewed work")
+        self.assertEqual(journal["phase"], "rolledBack")
+
     def test_branch_change_blocks_reviewed_restore(self):
         self.write("a.txt", b"work")
         restore = RestoreService(self.core)
@@ -503,6 +658,15 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(service.execute(service.prepare(["hello.py"]), "feat: initial", [])["expected"])
 
     def test_process_crash_after_write_can_be_recovered_on_restart(self):
+        self.crash_restore_at("afterWrite")
+
+    def test_process_crash_after_displacement_recovers_the_missing_path(self):
+        self.crash_restore_at("afterDisplace")
+
+    def test_process_crash_after_publication_recovers_the_original_file(self):
+        self.crash_restore_at("afterPublish")
+
+    def crash_restore_at(self, phase):
         self.write("a.txt", b"recover me")
         storage = self.store.directory
         self.store.close()
@@ -519,12 +683,12 @@ from dev_snapshot.common import settings_from
 git = Git(Path(sys.argv[2])); store = Store(Path(sys.argv[3]), git.identity())
 core = SnapshotService(git, store, settings_from(None))
 def fault(phase, name):
-    if phase == 'afterWrite': os._exit(42)
+    if phase == sys.argv[5]: os._exit(42)
 service = RestoreService(core, fault=fault)
 service.apply(service.prepare(sys.argv[4])['id'])
 """
-        result = subprocess.run([sys.executable, "-I", "-S", "-c", code, backend, str(self.root), str(storage), self.initial["id"]], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        self.assertEqual(result.returncode, 42, result.stderr.decode())
+        result = subprocess.run([sys.executable, "-I", "-S", "-c", code, backend, str(self.root), str(storage), self.initial["id"], phase], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(result.returncode, 42, result.stderr.decode(errors="replace"))
         self.store = Store(storage, self.identity)
         self.core = SnapshotService(self.git, self.store, self.config)
         journal = self.store.journals()[0]
@@ -533,6 +697,7 @@ service.apply(service.prepare(sys.argv[4])['id'])
         service.rollback(journal)
         self.assertEqual((self.root / "a.txt").read_bytes(), b"recover me")
         self.assertEqual(journal["phase"], "rolledBack")
+        self.assertFalse(list(self.root.glob(".dev-snapshot-*.restore")))
 
     def test_path_validation_and_text_decoding(self):
         for name in ("../x", "/x", "a/../x", "a\\b", "a/.git/config", "C:/x", "a\0b"):
@@ -1168,6 +1333,51 @@ service.execute(journal, 'chore: crash boundary', [])
         with self.assertRaises(SafetyError):
             engine.call("historyDelete", {**params, "token": token, "approved": True})
         self.store.snapshot(older["id"], verify=True)
+
+    def test_commit_cleanup_preserves_other_branches_uncommitted_snapshots(self):
+        self.git.run("switch", "-c", "feature/uncommitted")
+        self.write("a.txt", b"feature work only in history")
+        feature = self.core.capture()
+        self.write("a.txt", b"baseline\r\n")
+        self.git.run("switch", "main")
+        self.core.capture()
+        self.write("a.txt", b"older main work")
+        older = self.core.capture()
+        self.write("a.txt", b"main selected")
+        selected = self.core.capture()
+        engine, session = Engine(), Session(self.git, self.store, self.config)
+        engine.sessions[self.identity["id"]] = session
+        self.addCleanup(engine.close)
+        params = {"repositoryId": self.identity["id"]}
+        journal = engine.call("commitPrepare", {**params, "snapshotId": selected["id"], "approved": True})
+        receipt = engine.call("commitExecute", {**params, "operationId": journal["id"], "message": "chore: main only", "snapshotIds": [selected["id"]], "approved": True})
+        review = receipt["cleanup"]
+        self.assertEqual(review["branch"], "refs/heads/main")
+        self.assertTrue(all(s["branch"] == "refs/heads/main" for s in review["candidates"]))
+        self.assertNotIn(feature["id"], {s["id"] for s in review["candidates"]})
+        self.assertIn(older["id"], {s["id"] for s in review["candidates"]})
+        engine.call("historyDelete", {**params, "token": review["token"], "approved": True})
+        self.store.snapshot(feature["id"], verify=True)
+        self.assertEqual(self.store.get(feature["entries"]["a.txt"]["hash"]), b"feature work only in history")
+        with self.assertRaises(FileNotFoundError):
+            self.store.snapshot(older["id"])
+
+    def test_cleanup_review_cannot_be_changed_to_another_branch(self):
+        engine, session, params, older, selected, later, receipt = self.history_fixture()
+        review = dict(receipt["cleanup"])
+        review.pop("token")
+        review["branch"] = "refs/heads/other"
+        with self.assertRaises(SafetyError):
+            self.store.delete_history_before(review)
+        self.store.snapshot(older["id"], verify=True)
+
+    def test_history_cleanup_blocks_detached_head_boundaries(self):
+        self.git.run("switch", "--detach", "HEAD")
+        self.write("a.txt", b"detached work")
+        selected = self.core.capture()
+        with self.assertRaisesRegex(SafetyError, "attached branch"):
+            self.store.history_before(selected["id"])
+        self.store.snapshot(self.initial["id"], verify=True)
 
     def test_commit_cleanup_rechecks_new_pins_before_any_deletion(self):
         engine, session, params, older, selected, later, receipt = self.history_fixture()

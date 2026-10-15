@@ -484,7 +484,7 @@ class Engine:
         elif method == "recoveryReport":
             journal = self._journal(session, params["operationId"])
             return {"journal": journal, "files": session.restore.report(journal) if journal["kind"] != "commit" else [],
-                    "currentContext": session.git.context()}
+                    "currentContext": session.git.context(), "preservedFiles": session.restore.files.preserved(journal)}
         elif method == "recover":
             self._approved(params, writers=True)
             journal = self._journal(session, params["operationId"])
@@ -502,6 +502,9 @@ class Engine:
         elif method == "exportBackup":
             self._approved(params)
             snapshot = store.snapshot(params["snapshotId"], verify=True)
+            journal = self._journal(session, params["operationId"]) if params.get("operationId") else None
+            if journal and journal["backupId"] != snapshot["id"]:
+                raise SafetyError("Preserved files must belong to the selected recovery backup.")
             destination = Path(params["destination"]).resolve(strict=True)
             if destination.is_relative_to(session.git.root) or destination.is_relative_to(store.directory):
                 raise SafetyError("Choose an export directory outside the working repository and snapshot storage.")
@@ -510,6 +513,8 @@ class Engine:
             for name, entry in snapshot["entries"].items():
                 if entry["state"] == "present":
                     atomic_write(safe_path(export, name), store.get(entry["hash"], entry["size"]), 0o700 if entry["executable"] else 0o600)
+            if journal:
+                session.restore.files.export(journal, export)
             result = str(export)
         else:
             raise SafetyError("Unknown engine method.")

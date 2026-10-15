@@ -7,7 +7,7 @@ export interface Repository { id: string; root: string; writable: boolean; pause
 export interface SnapshotItem { id: string; reason: string; endedAt: string; summary: string; changedFiles: number; commitSummary?: string | null; commitChangedFiles?: number | null; comparisonPruned: boolean; boundaryState?: 'ready' | 'committed' | 'unavailable'; rangeError?: string | null; metadata: { pinned: boolean; validation: string; commitIds: string[]; title?: string }; context: GitContext }
 export interface RestorePlan { id: string; targetId: string; backupId: string; context: GitContext; changes: Change[]; skipped: { path: string; reason: string }[]; planHash: string }
 export interface Diff { path: string; left: string; right: string; leftAbsent: boolean; rightAbsent: boolean }
-export interface HistoryReview { token: string; snapshotId: string; cutoffAt: string; candidates: { id: string; endedAt: string; reason: string }[]; protectedCount: number }
+export interface HistoryReview { token: string; snapshotId: string; cutoffAt: string; branch: string; candidates: { id: string; endedAt: string; reason: string; branch: string }[]; protectedCount: number }
 export interface BoundaryReview { snapshotId: string; boundaryId: string | null; context: GitContext; changes: Change[]; skipped: { path: string; reason: string }[]; summary: string; message: string }
 export interface Receipt { oid: string; expected: boolean; actualTree: string; reviewedTree: string; cleanup?: HistoryReview; cleanupError?: boolean }
 export interface PushReview { token: string; remote: string; branch: string; context: GitContext; commits: string[] }

@@ -283,14 +283,14 @@ class Application {
         try {
           if (review.candidates.length) {
             await this.documents.text('커밋 후 이전 스냅샷 정리', [
-              `완료된 커밋: ${receipt.oid}`, `선택한 스냅샷: ${review.snapshotId}`, `기준 시각: ${new Date(review.cutoffAt).toLocaleString()}`,
+              `완료된 커밋: ${receipt.oid}`, `정리 브랜치: ${review.branch.replace(/^refs\/heads\//, '')}`, `선택한 스냅샷: ${review.snapshotId}`, `기준 시각: ${new Date(review.cutoffAt).toLocaleString()}`,
               `삭제 대상: ${review.candidates.length}개 / 보호되어 유지: ${review.protectedCount}개`,
-              '선택한 스냅샷과 이후 기록은 유지합니다. 고정 기록·활성 작업 시작 상태·복구 백업은 보호합니다.',
+              '다른 브랜치의 기록과 선택한 스냅샷·이후 기록은 유지합니다. 고정 기록·활성 작업 시작 상태·복구 백업은 보호합니다.',
               '기록 관리에서 제외한 파일과 Git 변환 전 원본 바이트는 Git 커밋의 보존 범위와 다를 수 있습니다.',
               '삭제한 기록은 되돌릴 수 없습니다. 취소하면 모든 기록을 유지합니다.', '',
-              ...review.candidates.map(s => `${new Date(s.endedAt).toLocaleString()} · ${s.reason} · ${s.id}`),
+              ...review.candidates.map(s => `${new Date(s.endedAt).toLocaleString()} · ${s.branch.replace(/^refs\/heads\//, '')} · ${s.reason} · ${s.id}`),
             ].join('\n'));
-            if (await vscode.window.showWarningMessage(`커밋이 완료되었습니다. 선택한 스냅샷보다 오래된 기록 ${review.candidates.length}개를 영구 삭제할까요? 보호 기록 ${review.protectedCount}개는 유지합니다.`, { modal: true }, '이전 기록 삭제 승인')) {
+            if (await vscode.window.showWarningMessage(`${review.branch.replace(/^refs\/heads\//, '')} 브랜치에서 선택한 스냅샷보다 오래된 기록 ${review.candidates.length}개를 영구 삭제할까요? 다른 브랜치의 기록과 보호 기록 ${review.protectedCount}개는 유지합니다.`, { modal: true }, '이전 기록 삭제 승인')) {
               const result = await this.call<{ deleted: number }>('historyDelete', repo, { token: review.token, approved: true });
               void vscode.window.showInformationMessage(`이전 스냅샷 ${result.deleted}개를 삭제했습니다.`);
             }
@@ -310,8 +310,9 @@ class Application {
     let journal = item?.journal;
     if (!journal) journal = (await vscode.window.showQuickPick(repo.recoveries.map(j => ({ label: `${j.kind}: ${j.phase}`, description: j.createdAt, journal: j })), { title: '미완료 작업 선택' }))?.journal;
     if (!journal) return;
-    const report = await this.call<{ journal: Journal; files: { path: string; status: string }[]; currentContext: GitContext }>('recoveryReport', repo, { operationId: journal.id });
-    await this.documents.text('복구 상태', [`작업: ${journal.id}`, `상태: ${journal.phase}`, `보호 백업: ${journal.backupId}`, `작업 전 HEAD: ${report.journal.context?.head ?? '없음'}`, `현재 HEAD: ${report.currentContext.head ?? '없음'}`, `Git 작업 또는 잠금 감지: ${report.currentContext.busy ? '있음' : '없음'}`, '', ...report.files.map(f => `${f.status}  ${f.path}`), '', 'before: 작업 이전 / after: 확장 적용 결과 / conflict: 별도 수정 또는 불확실', '충돌 파일은 자동으로 덮어쓰지 않습니다. 커밋 이력은 자동 reset하지 않습니다.', ...(journal.mode === 'boundary' ? ['구간 커밋은 확인된 커밋 결과에 맞춰 인덱스를 복구하며 최신 작업 파일을 유지합니다.', '강제 종료 후 index.lock이 남으면 다른 Git 프로세스가 없는지 확인하고 수동 정리해야 합니다.', `마지막 잠금 소유 프로세스(참고): ${report.journal.indexLockOwnerPid ?? '미확인'}`] : [])].join('\n'));
+    const report = await this.call<{ journal: Journal; files: { path: string; status: string }[]; currentContext: GitContext; preservedFiles: { path: string; directory: string }[] }>('recoveryReport', repo, { operationId: journal.id });
+    const preserved = report.preservedFiles.length ? ['외부 변경 보존 폴더 (저장소 기준 경로):', ...report.preservedFiles.map(f => `${f.path}: ${f.directory}`), '보존 파일은 백업 내보내기에 함께 포함됩니다. 내용을 확인하기 전에는 폴더를 삭제하지 마세요.', '직접 해결 확인 후에도 보존 폴더는 자동 삭제하지 않습니다.', ''] : [];
+    await this.documents.text('복구 상태', [`작업: ${journal.id}`, `상태: ${journal.phase}`, `보호 백업: ${journal.backupId}`, `작업 전 HEAD: ${report.journal.context?.head ?? '없음'}`, `현재 HEAD: ${report.currentContext.head ?? '없음'}`, `Git 작업 또는 잠금 감지: ${report.currentContext.busy ? '있음' : '없음'}`, '', ...report.files.map(f => `${f.status}  ${f.path}`), '', ...preserved, 'before: 작업 이전 / after: 확장 적용 결과 / conflict: 별도 수정 또는 불확실', '충돌 파일은 자동으로 덮어쓰지 않습니다. 커밋 이력은 자동 reset하지 않습니다.', ...(journal.mode === 'boundary' ? ['구간 커밋은 확인된 커밋 결과에 맞춰 인덱스를 복구하며 최신 작업 파일을 유지합니다.', '강제 종료 후 index.lock이 남으면 다른 Git 프로세스가 없는지 확인하고 수동 정리해야 합니다.', `마지막 잠금 소유 프로세스(참고): ${report.journal.indexLockOwnerPid ?? '미확인'}`] : [])].join('\n'));
     const action = await vscode.window.showQuickPick([journal.mode === 'boundary' ? '생성된 커밋 확인 및 안전한 인덱스 복구' : '안전하게 이전 상태로 복구 시도', '백업 파일을 외부 폴더로 내보내기', '직접 해결했음을 확인하고 기록 재개 허용'], { title: '복구 작업 선택' });
     if (!action) return;
     if (action.startsWith('안전하게') || action.startsWith('생성된')) {
@@ -320,7 +321,7 @@ class Application {
     } else if (action.startsWith('백업')) {
       const destination = await vscode.window.showOpenDialog({ canSelectFolders: true, canSelectFiles: false, canSelectMany: false, title: '저장소 밖의 백업 내보내기 폴더 선택' });
       if (!destination?.[0]) return;
-      const result = await this.call<string>('exportBackup', repo, { snapshotId: journal.backupId, destination: destination[0].fsPath, approved: true });
+      const result = await this.call<string>('exportBackup', repo, { snapshotId: journal.backupId, operationId: journal.id, destination: destination[0].fsPath, approved: true });
       void vscode.window.showInformationMessage(`보호 백업을 내보냈습니다: ${result}`);
     } else {
       if (!await vscode.window.showWarningMessage('작업 파일과 Git 상태를 직접 검토·해결했음을 확인합니까? 이 동작은 파일을 복구하지 않습니다.', { modal: true }, '해결 확인')) return;

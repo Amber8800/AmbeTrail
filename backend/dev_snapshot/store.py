@@ -12,6 +12,7 @@ from pathlib import Path
 from .common import (MAX_FILE, SafetyError, atomic_write, digest, encode, fsync_directory,
                      is_link, native_path, read_json, relative_path, sha, utc_now, validate_entries,
                      validate_hash, validate_id, validate_title, write_json)
+from .restore_io import validate_move
 
 
 class Store:
@@ -304,6 +305,10 @@ class Store:
                 validate_entries({change["path"]: change["after"]})
             if item.get("targetId"):
                 validate_id(item["targetId"])
+            if not isinstance(item.get("fileMoves", []), list):
+                raise SafetyError("Invalid preserved restore file list.")
+            for move in item.get("fileMoves", []):
+                validate_move(move)
             result.append(item)
         return sorted(result, key=lambda j: j["createdAt"], reverse=True)
 
@@ -359,14 +364,17 @@ class Store:
             self._delete_snapshot(snapshot_id)
 
     def history_before(self, snapshot_id: str) -> dict:
-        """Review older history; independent manifests keep the cutoff restorable."""
+        """Review older history on the committed branch only."""
         target = self.snapshot(snapshot_id)
         if target["reason"] == "backup":
             raise SafetyError("Select a timeline snapshot as the cleanup boundary.")
         protected = self.protected_ids()
-        older = [s for s in self.snapshots() if s["endedAt"] < target["endedAt"]]
-        return {"snapshotId": snapshot_id, "cutoffAt": target["endedAt"],
-                "candidates": [{"id": s["id"], "endedAt": s["endedAt"], "reason": s["reason"]}
+        branch = target["context"]["branch"]
+        if not branch:
+            raise SafetyError("History cleanup requires a snapshot from an attached branch.")
+        older = [s for s in self.snapshots() if s["endedAt"] < target["endedAt"] and s["context"]["branch"] == branch]
+        return {"snapshotId": snapshot_id, "cutoffAt": target["endedAt"], "branch": branch,
+                "candidates": [{"id": s["id"], "endedAt": s["endedAt"], "reason": s["reason"], "branch": s["context"]["branch"]}
                                for s in older if s["id"] not in protected],
                 "protectedCount": sum(s["id"] in protected for s in older)}
 

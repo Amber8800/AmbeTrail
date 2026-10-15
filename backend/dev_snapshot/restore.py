@@ -6,10 +6,11 @@ import sys
 import time
 from typing import Callable
 
-from .common import (ABSENT, SafetyError, atomic_write, digest, fsync_directory,
+from .common import (ABSENT, SafetyError, digest,
                      new_id, safe_path, utc_now)
 from .git import same_context
 from .snapshots import Policy, SnapshotService
+from .restore_io import RestoreFiles
 
 
 def unfinished(journal: dict) -> bool:
@@ -23,6 +24,7 @@ class RestoreService:
         self.dirty = dirty or (lambda: set())
         self.fault = fault or (lambda phase, name: None)
         self.plans: dict[str, dict] = {}
+        self.files = RestoreFiles(core, self.guard, self.fault)
 
     def guard(self, names: list[str]) -> None:
         if set(names) & self.dirty():
@@ -129,7 +131,7 @@ class RestoreService:
                 journal["inFlight"] = change["path"]
                 store.journal(journal)
                 self.fault("beforeWrite", change["path"])
-                self._write(change["path"], change["after"], change["before"], policy)
+                self.files.write(journal, change["path"], change["after"], change["before"], policy)
                 self.fault("afterWrite", change["path"])
                 if not self.core.matches(change["path"], change["after"], policy):
                     raise SafetyError("Restored file failed verification.")
@@ -141,6 +143,8 @@ class RestoreService:
             for change in plan["changes"]:
                 if not self.core.matches(change["path"], change["after"], policy):
                     raise SafetyError("Restored file changed before final verification.")
+            if self.files.cleanup(journal):
+                raise SafetyError("Files changed during restore. Preserved files require recovery review.")
             journal["phase"] = "complete"
             store.journal(journal)
             self.core.changed()
@@ -149,47 +153,32 @@ class RestoreService:
             self.rollback(journal)
             raise
 
-    def _write(self, name: str, desired: dict, expected: dict, policy: Policy | None = None) -> None:
-        self.guard([name])
-        if desired["state"] == "excluded" or expected["state"] == "excluded":
-            raise SafetyError("Excluded files cannot be restored.")
-        target = safe_path(self.core.git.root, name)
-        if not self.core.matches(name, expected, policy):
-            raise SafetyError("File changed before replacement.")
-        if desired["state"] == "absent":
-            if expected["state"] == "present":
-                target.unlink()
-                fsync_directory(target.parent)
-            return
-        data = self.core.store.get(desired["hash"], desired["size"])
-        target.parent.mkdir(parents=True, exist_ok=True)
-        safe_path(self.core.git.root, name)
-        # The complete preimage is already durable in the protected backup.
-        # No extension can atomically compare-and-swap arbitrary external filesystem writers.
-        atomic_write(target, data, 0o700 if desired["executable"] else 0o600)
-
     def rollback(self, journal: dict) -> None:
         candidates = set(journal["applied"])
         if journal.get("inFlight"):
             candidates.add(journal["inFlight"])
-        conflicts = []
+        conflicts = set()
         policy = Policy(self.core)
         if not same_context(journal["context"], self.core.git.context()):
-            conflicts = sorted(candidates)
+            conflicts.update(candidates)
+            conflicts.update(move["path"] for move in journal.get("fileMoves", []))
         else:
+            conflicts.update(self.files.recover_missing(journal))
             for change in reversed(journal["changes"]):
-                if change["path"] not in candidates:
+                if change["path"] not in candidates or change["path"] in conflicts:
                     continue
                 try:
                     self.guard([change["path"]])
                     if self.core.matches(change["path"], change["before"], policy):
                         continue
                     if not self.core.matches(change["path"], change["after"], policy):
-                        conflicts.append(change["path"])
+                        conflicts.add(change["path"])
                         continue
-                    self._write(change["path"], change["before"], change["after"], policy)
+                    self.files.write(journal, change["path"], change["before"], change["after"], policy)
                 except (OSError, SafetyError):
-                    conflicts.append(change["path"])
+                    conflicts.add(change["path"])
+            conflicts.update(self.files.recover_missing(journal))
+        conflicts = self.files.cleanup(journal, preserve=conflicts)
         journal["conflicts"] = sorted(set(conflicts))
         journal["phase"] = "recoveryRequired" if conflicts else "rolledBack"
         journal.pop("inFlight", None)
