@@ -27,6 +27,7 @@
       { "command": "devSnapshot.undoRestore", "title": "Amberog: Undo Last Restore" },
       { "command": "devSnapshot.prepareCommit", "title": "Amberog: 이 시점까지의 작업 커밋", "icon": "$(git-commit)" },
       { "command": "devSnapshot.renameSnapshot", "title": "Amberog: 작업 이름 편집", "icon": "$(edit)" },
+      { "command": "devSnapshot.deleteSnapshot", "title": "Amberog: 스냅샷 삭제", "icon": "$(trash)" },
       { "command": "devSnapshot.push", "title": "Amberog: Review and Push" },
       { "command": "devSnapshot.pinSnapshot", "title": "Amberog: Toggle Snapshot Pin", "icon": "$(pin)" },
       { "command": "devSnapshot.manageHistory", "title": "Amberog: Manage History" },
@@ -40,8 +41,10 @@
       "view/item/context": [
         { "command": "devSnapshot.prepareCommit", "when": "view == devSnapshot.timeline && viewItem == snapshot", "group": "inline@1" },
         { "command": "devSnapshot.restoreSnapshot", "when": "view == devSnapshot.timeline && viewItem == snapshot", "group": "inline@2" },
+        { "command": "devSnapshot.deleteSnapshot", "when": "view == devSnapshot.timeline && viewItem == snapshot", "group": "inline@3" },
         { "command": "devSnapshot.renameSnapshot", "when": "view == devSnapshot.timeline && viewItem == snapshot", "group": "edit@1" },
-        { "command": "devSnapshot.pinSnapshot", "when": "view == devSnapshot.timeline && viewItem == snapshot", "group": "edit@2" }
+        { "command": "devSnapshot.pinSnapshot", "when": "view == devSnapshot.timeline && viewItem == snapshot", "group": "edit@2" },
+        { "command": "devSnapshot.deleteSnapshot", "when": "view == devSnapshot.timeline && viewItem == snapshot", "group": "edit@3" }
       ]
     },
     "configuration": {
@@ -67,7 +70,7 @@
     "compile:test": "tsc",
     "test": "npm run test:python && npm run test:bridge",
     "test:python": "node scripts/python.mjs backend/test_runner.py",
-    "test:bridge": "npm run compile:test && node --test out/test/bridge.test.js",
+    "test:bridge": "npm run compile:test && node --test out/test/bridge.test.js out/test/extension.test.js",
     "test:integration": "npm run build && npm run compile:test && node out/test/runIntegration.js",
     "benchmark": "node scripts/python.mjs backend/benchmark.py",
     "package": "npm run build && vsce package --out amberog-0.1.4.vsix",

@@ -466,8 +466,15 @@ class Engine:
             result = store.update_metadata(params["snapshotId"], pinned=not store.metadata(params["snapshotId"])["pinned"])
         elif method == "usage":
             protected = store.protected_ids()
+            snapshots = []
+            for s in store.snapshots():
+                internal = store.is_internal_baseline(s)
+                fallback_title = "이전 내부 비교 기준" if internal else "기존 미커밋 작업" if s["reason"] == "initial" else s.get("summary", "복구 백업" if s["reason"] == "backup" else "저장된 파일 상태")
+                snapshots.append({"id": s["id"], "endedAt": s["endedAt"], "reason": s["reason"],
+                                  "internalBaseline": internal, "protected": s["id"] in protected,
+                                  "title": store.metadata(s["id"]).get("title") or fallback_title, "context": s["context"]})
             return {"bytes": store.usage(), "limit": session.core.config["maxStorageMiB"] * 1024 * 1024,
-                    "snapshots": [{"id": s["id"], "endedAt": s["endedAt"], "reason": s["reason"], "internalBaseline": store.is_internal_baseline(s), "protected": s["id"] in protected} for s in store.snapshots()]}
+                    "snapshots": snapshots}
         elif method == "prune":
             result = store.prune(session.core.config)
         elif method == "deleteSnapshot":

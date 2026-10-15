@@ -1051,6 +1051,79 @@ service.execute(journal, 'chore: crash boundary', [])
         self.assertEqual(session.timeline()[0]["summary"], "timeline.ts 추가")
         self.assertEqual(self.store.record("snapshots", selected["id"]).read_bytes(), original)
 
+    def snapshot_delete_fixture(self):
+        self.write("a.txt", b"older work")
+        older = self.core.capture()
+        self.write("a.txt", b"selected work")
+        selected = self.core.capture()
+        self.write("a.txt", b"latest work")
+        latest = self.core.capture()
+        engine = Engine()
+        session = Session(self.git, self.store, self.config)
+        engine.sessions[self.identity["id"]] = session
+        self.addCleanup(engine.close)
+        return engine, session, {"repositoryId": self.identity["id"]}, older, selected, latest
+
+    def test_usage_identifies_saved_branches_custom_titles_internal_baselines_and_backups(self):
+        engine, session, params, older, selected, latest = self.snapshot_delete_fixture()
+        self.store.update_metadata(selected["id"], title="삭제 확인용 작업")
+        self.git.run("switch", "-c", "feature/history")
+        switched = self.core.capture()
+        backup = self.core.backup(switched["entries"], switched["context"])
+        original = {s["id"]: self.store.record("snapshots", s["id"]).read_bytes() for s in self.store.snapshots()}
+        records = {s["id"]: s for s in engine.call("usage", params)["snapshots"]}
+        self.assertEqual(records[selected["id"]]["title"], "삭제 확인용 작업")
+        self.assertEqual(records[selected["id"]]["context"]["branch"], "refs/heads/main")
+        self.assertEqual(records[switched["id"]]["context"]["branch"], "refs/heads/feature/history")
+        self.assertEqual(records[self.initial["id"]]["title"], "이전 내부 비교 기준")
+        self.assertEqual(records[backup["id"]]["title"], "복구 백업")
+        self.assertTrue(records[backup["id"]]["protected"])
+        for record_id, contents in original.items():
+            self.assertEqual(self.store.record("snapshots", record_id).read_bytes(), contents)
+
+    def test_single_delete_requires_approval_and_preserves_other_snapshots_git_and_files(self):
+        engine, session, params, older, selected, latest = self.snapshot_delete_fixture()
+        with self.assertRaises(SafetyError):
+            engine.call("deleteSnapshot", {**params, "snapshotId": selected["id"]})
+        self.store.snapshot(selected["id"], verify=True)
+        context, index = self.git.context(), self.git.index_bytes()
+        engine.call("deleteSnapshot", {**params, "snapshotId": selected["id"], "approved": True})
+        with self.assertRaises(FileNotFoundError):
+            self.store.snapshot(selected["id"])
+        for snapshot in (self.initial, older, latest):
+            self.store.snapshot(snapshot["id"], verify=True)
+        self.assertFalse(self.store._object(selected["entries"]["a.txt"]["hash"]).exists())
+        timeline = {s["id"]: s for s in session.timeline()}
+        self.assertTrue(timeline[latest["id"]]["comparisonPruned"])
+        self.assertTrue(session.snapshot_changes(latest["id"]))
+        self.assertEqual(self.git.context(), context)
+        self.assertEqual(self.git.index_bytes(), index)
+        self.assertEqual((self.root / "a.txt").read_bytes(), b"latest work")
+        restore = RestoreService(self.core)
+        restore.apply(restore.prepare(older["id"])["id"])
+        self.assertEqual((self.root / "a.txt").read_bytes(), b"older work")
+
+    def test_single_delete_rechecks_protection_and_preserves_latest_initial_pins_and_backups(self):
+        engine, session, params, older, selected, latest = self.snapshot_delete_fixture()
+        review = engine.call("usage", params)
+        self.assertFalse(next(s for s in review["snapshots"] if s["id"] == selected["id"])["protected"])
+        self.store.update_metadata(selected["id"], pinned=True)
+        backup = self.core.backup(latest["entries"], latest["context"])
+        for snapshot in (selected, latest, self.initial, backup):
+            with self.assertRaises(SafetyError):
+                engine.call("deleteSnapshot", {**params, "snapshotId": snapshot["id"], "approved": True})
+            self.store.snapshot(snapshot["id"], verify=True)
+
+    def test_single_delete_preserves_latest_committed_boundary(self):
+        engine, session, params, older, selected, latest = self.snapshot_delete_fixture()
+        journal = engine.call("commitPrepare", {**params, "snapshotId": selected["id"], "approved": True})
+        receipt = engine.call("commitExecute", {**params, "operationId": journal["id"], "message": "chore: boundary",
+                                               "snapshotIds": [selected["id"]], "approved": True})
+        self.assertTrue(receipt["expected"])
+        with self.assertRaises(SafetyError):
+            engine.call("deleteSnapshot", {**params, "snapshotId": selected["id"], "approved": True})
+        self.store.snapshot(selected["id"], verify=True)
+
     def history_fixture(self):
         self.write("a.txt", b"older work")
         older = self.core.capture()

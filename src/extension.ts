@@ -3,12 +3,18 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { PythonBridge } from './bridge';
 import { ReviewDocuments } from './documents';
-import { compactTime, repositoryStatus, workTitle } from './presentation';
+import { branchColor, branchLabel, compactTime, repositoryStatus, snapshotContext, workTitle } from './presentation';
 import { BoundaryReview, CaptureJob, Change, Diff, GitContext, Journal, PushReview, Receipt, Repository, RestorePlan, SnapshotItem } from './protocol';
 
 interface GitRepository { rootUri: vscode.Uri; state: { onDidChange: vscode.Event<void> } }
 interface GitApi { git: { path: string }; repositories: GitRepository[]; onDidOpenRepository: vscode.Event<GitRepository>; onDidCloseRepository: vscode.Event<GitRepository> }
 interface GitExtension { enabled: boolean; getAPI(version: 1): GitApi; onDidChangeEnablement: vscode.Event<boolean> }
+
+interface HistorySnapshot {
+  id: string; endedAt: string; reason: string; internalBaseline: boolean; protected: boolean;
+  title: string; context: GitContext;
+}
+interface HistoryUsage { bytes: number; limit: number; snapshots: HistorySnapshot[] }
 
 type Kind = 'repository' | 'snapshot' | 'file' | 'message' | 'recovery' | 'more';
 class Item extends vscode.TreeItem {
@@ -52,10 +58,11 @@ class Timeline implements vscode.TreeDataProvider<Item> {
         node.id = `${repo.id}/${snapshot.id}`;
         node.description = compactTime(snapshot.endedAt);
         if (snapshot.boundaryState === 'committed') node.description += ' · 커밋됨';
-        node.tooltip = `${workTitle(snapshot)}\n${new Date(snapshot.endedAt).toLocaleString()}\n이번 기록: 파일 ${snapshot.changedFiles}개 변경 · 미검증${snapshot.metadata.pinned ? ' · 고정' : ''}${snapshot.metadata.commitIds.length ? ' · 커밋 연결' : ''}\n자동 요약: ${snapshot.summary}\n${snapshot.reason === 'initial' ? '확장 시작 전에 존재하던 미커밋 작업' : snapshot.reason}\n커밋 버튼: 직전 커밋 경계부터 이 시점까지 / 복원 버튼: 이 스냅샷 복원\n우클릭 → 작업 이름 편집\n복원 시 객체 무결성을 검사합니다. 정상 동작을 검증한 상태는 아닙니다.\n${snapshot.comparisonPruned ? '이전 비교 기록이 삭제되어 포함 파일 기준으로 표시합니다.' : ''}`;
+        node.tooltip = `${workTitle(snapshot)}\n${new Date(snapshot.endedAt).toLocaleString()}\n${snapshotContext(snapshot.context)}\n이번 기록: 파일 ${snapshot.changedFiles}개 변경 · 미검증${snapshot.metadata.pinned ? ' · 고정' : ''}${snapshot.metadata.commitIds.length ? ' · 커밋 연결' : ''}\n자동 요약: ${snapshot.summary}\n${snapshot.reason === 'initial' ? '확장 시작 전에 존재하던 미커밋 작업' : snapshot.reason}\n커밋 버튼: 직전 커밋 경계부터 이 시점까지 / 복원 버튼: 이 스냅샷 복원 / 휴지통: 기록 삭제\n우클릭 → 작업 이름 편집\n복원 시 객체 무결성을 검사합니다. 정상 동작을 검증한 상태는 아닙니다.\n${snapshot.comparisonPruned ? '이전 비교 기록이 삭제되어 포함 파일 기준으로 표시합니다.' : ''}`;
         if (snapshot.commitSummary && snapshot.commitChangedFiles != null) node.tooltip += `\n커밋 대상 구간: ${snapshot.commitSummary} · 파일 ${snapshot.commitChangedFiles}개`;
         if (snapshot.rangeError) node.tooltip += `\n커밋 구간 계산 불가: ${snapshot.rangeError}\n이번 기록의 요약은 그대로 표시합니다.`;
-        node.iconPath = new vscode.ThemeIcon(snapshot.metadata.pinned ? 'pinned' : snapshot.boundaryState === 'committed' ? 'check' : 'circle-small-filled');
+        node.accessibilityInformation = { label: `${workTitle(snapshot)} · ${snapshotContext(snapshot.context)}` };
+        node.iconPath = new vscode.ThemeIcon(snapshot.metadata.pinned ? 'pinned' : snapshot.boundaryState === 'committed' ? 'check' : 'circle-small-filled', new vscode.ThemeColor(branchColor(snapshot.context.branch)));
         result.push(node);
       }
       if (snapshots.length === limit && limit < 1000) {
@@ -66,10 +73,16 @@ class Timeline implements vscode.TreeDataProvider<Item> {
       return result;
     }
     if (item.kind === 'snapshot' && item.snapshot) {
+      const context = item.snapshot.context;
+      const branch = new Item('message', `브랜치: ${branchLabel(context)}`, repo);
+      branch.id = `${repo.id}/branch/${item.snapshot.id}`;
+      branch.description = context.head?.slice(0, 8) || '커밋 없음';
+      branch.tooltip = snapshotContext(context);
+      branch.iconPath = new vscode.ThemeIcon('git-branch', new vscode.ThemeColor(branchColor(context.branch)));
       const changes = await this.app.call<Change[]>('snapshotChanges', repo, { snapshotId: item.snapshot.id });
       const filenames = new Map<string, number>();
       for (const change of changes) { const name = path.posix.basename(change.path); filenames.set(name, (filenames.get(name) ?? 0) + 1); }
-      return changes.map(change => {
+      return [branch, ...changes.map(change => {
         const kind = change.kind === 'added' ? '추가' : change.kind === 'deleted' ? '삭제' : '수정';
         const node = new Item('file', path.posix.basename(change.path), repo, item.snapshot, change);
         node.id = `${repo.id}/${item.snapshot!.id}/${change.path}`;
@@ -78,7 +91,7 @@ class Timeline implements vscode.TreeDataProvider<Item> {
         node.iconPath = new vscode.ThemeIcon(change.kind === 'added' ? 'diff-added' : change.kind === 'deleted' ? 'diff-removed' : 'diff-modified');
         node.command = { command: 'devSnapshot.openDiff', title: 'Diff', arguments: [node] };
         return node;
-      });
+      })];
     }
     return [];
   }
@@ -313,14 +326,38 @@ class Application {
     }
     await this.refresh();
   }
+  private async deleteSnapshot(repo: Repository, target: { id: string }): Promise<void> {
+    if (!repo.writable) {
+      void vscode.window.showInformationMessage('읽기 전용 세션에서는 기록을 삭제할 수 없습니다.');
+      return;
+    }
+    const usage = await this.call<HistoryUsage>('usage', repo);
+    const snapshot = usage.snapshots.find(s => s.id === target.id);
+    if (!snapshot) {
+      void vscode.window.showInformationMessage('이미 삭제되었거나 더 이상 사용할 수 없는 기록입니다.');
+      return;
+    }
+    if (snapshot.protected) {
+      void vscode.window.showInformationMessage('보호된 기록은 삭제할 수 없습니다. 최신 기록, 고정 기록, 활성 초기 상태, 최신 커밋 경계 또는 복구용 보호 기록에 해당합니다.');
+      return;
+    }
+    const approved = await vscode.window.showWarningMessage([
+      '이 스냅샷을 영구 삭제합니까?', `작업: ${snapshot.title}`,
+      `저장 시각: ${new Date(snapshot.endedAt).toLocaleString()}`, snapshotContext(snapshot.context),
+      '다른 기록에 참조되지 않는 파일 내용도 정리됩니다.',
+    ].join('\n'), { modal: true }, '기록 삭제 승인');
+    if (approved !== '기록 삭제 승인') return;
+    await this.call('deleteSnapshot', repo, { snapshotId: snapshot.id, approved: true });
+    await this.refresh();
+  }
   private async manage(repo: Repository): Promise<void> {
-    const usage = await this.call<{ bytes: number; limit: number; snapshots: { id: string; endedAt: string; reason: string; internalBaseline: boolean; protected: boolean }[] }>('usage', repo);
+    const usage = await this.call<HistoryUsage>('usage', repo);
     const action = await vscode.window.showQuickPick(['보존 정책으로 정리', '스냅샷 삭제', repo.paused ? '자동 기록 재개' : '자동 기록 일시 중지'], { title: `기록 관리 · ${(usage.bytes / 1048576).toFixed(1)} / ${(usage.limit / 1048576).toFixed(0)} MiB` });
     if (!action) return;
     if (action === '보존 정책으로 정리') await this.call('prune', repo);
     else if (action === '스냅샷 삭제') {
-      const picked = await vscode.window.showQuickPick(usage.snapshots.filter(s => !s.protected).map(s => ({ label: `${new Date(s.endedAt).toLocaleString()} · ${s.internalBaseline ? '이전 내부 비교 기준' : s.reason}`, id: s.id })), { title: '삭제할 비보호 기록 선택 · 제외 정책 변경은 과거 기록을 지우지 않습니다' });
-      if (picked && await vscode.window.showWarningMessage('이 스냅샷을 영구 삭제합니까? 다른 기록에 참조되지 않는 파일 내용도 정리됩니다.', { modal: true }, '기록 삭제 승인')) await this.call('deleteSnapshot', repo, { snapshotId: picked.id, approved: true });
+      const picked = await vscode.window.showQuickPick(usage.snapshots.filter(s => !s.protected).map(s => ({ label: s.title, description: compactTime(s.endedAt), detail: `${snapshotContext(s.context).replace('\n', ' · ')}${s.internalBaseline ? ' · 이전 내부 비교 기준' : s.reason === 'backup' ? ' · 보호 기간이 끝난 백업' : ''}`, id: s.id })), { title: '삭제할 비보호 기록 선택 · 제외 정책 변경은 과거 기록을 지우지 않습니다' });
+      if (picked) await this.deleteSnapshot(repo, picked);
     } else await this.call(repo.paused ? 'resume' : 'pause', repo);
     await this.refresh();
   }
@@ -363,6 +400,7 @@ class Application {
     });
     register('push', repo => this.push(repo));
     register('pinSnapshot', async (repo, item) => { const snapshot = await this.snapshot(repo, item); if (snapshot) await this.call('pin', repo, { snapshotId: snapshot.id }); });
+    register('deleteSnapshot', async (repo, item) => { const snapshot = await this.snapshot(repo, item); if (snapshot) await this.deleteSnapshot(repo, snapshot); });
     register('manageHistory', repo => this.manage(repo));
     register('recover', (repo, item) => this.recover(repo, item));
     register('more', async repo => { this.timeline.limits.set(repo.id, (this.timeline.limits.get(repo.id) ?? 50) + 50); this.timeline.refresh(); });
