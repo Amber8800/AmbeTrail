@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import gzip
 import shutil
 import subprocess
 import sys
@@ -12,14 +13,60 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
-from dev_snapshot.common import (ABSENT, SafetyError, relative_path,
-                                 settings_from, write_json)
+from dev_snapshot.common import (ABSENT, MAX_FILE, SafetyError, relative_path,
+                                 settings_from, sha, write_json)
 from dev_snapshot.commits import CommitService
 from dev_snapshot.engine import Engine, Session, display_bytes
 from dev_snapshot.git import Git
 from dev_snapshot.restore import RestoreService
 from dev_snapshot.snapshots import SnapshotService
 from dev_snapshot.store import Store
+
+
+class StoreReadTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="dev-snapshot-object-test-")
+        self.addCleanup(self.temporary.cleanup)
+        base = Path(self.temporary.name).resolve()
+        self.store = Store(base / "storage", {"schema": 1, "root": str(base / "repo"), "id": sha(b"test")})
+        self.addCleanup(self.store.close)
+
+    def test_bounded_read_checks_empty_small_and_multibuffer_objects(self):
+        for data in (b"", b"small", bytes(range(256)) * 1024):
+            with self.subTest(size=len(data)):
+                object_hash = self.store.put(data)
+                self.assertEqual(self.store.get(object_hash, len(data)), data)
+                self.assertEqual(self.store.get(object_hash), data)
+                self.assertEqual(self.store.put(data), object_hash)
+                with self.assertRaises(SafetyError):
+                    self.store.get(object_hash, len(data) + 1)
+                if data:
+                    with self.assertRaises(SafetyError):
+                        self.store.get(object_hash, len(data) - 1)
+
+    def test_bounded_read_rejects_crc_truncation_hash_and_extra_members(self):
+        data = b"stored bytes"
+        object_hash = self.store.put(data)
+        compressed = gzip.compress(data, mtime=0)
+        bad_crc = bytearray(compressed)
+        bad_crc[-8] ^= 1
+        empty_member = bytearray(gzip.compress(b"", mtime=0))
+        empty_member[-8] ^= 1
+        for corrupted in (bytes(bad_crc), compressed[:-1], gzip.compress(b"changed data", mtime=0),
+                          compressed + gzip.compress(b"extra", mtime=0), compressed + bytes(empty_member)):
+            with self.subTest(corrupted=corrupted):
+                self.store._object(object_hash).write_bytes(corrupted)
+                with self.assertRaises(SafetyError):
+                    self.store.get(object_hash, len(data))
+                # Deduplication must still verify an existing object and fail closed.
+                with self.assertRaises(SafetyError):
+                    self.store.put(data)
+
+    def test_invalid_expected_sizes_cannot_request_an_unbounded_read(self):
+        object_hash = self.store.put(b"small")
+        for size in (-2, -1, MAX_FILE + 1, True, 2.5):
+            with self.subTest(size=size), self.assertRaises(SafetyError):
+                self.store.get(object_hash, size)
 
 
 class CoreTests(unittest.TestCase):
@@ -837,6 +884,50 @@ service.apply(service.prepare(sys.argv[4])['id'])
         snapshot = self.core.capture("automatic", full=False, changed_paths={"folder"})
         self.assertEqual(snapshot["entries"]["folder/c.py"], ABSENT)
 
+    def test_directory_events_match_ancestors_without_matching_sibling_prefixes(self):
+        self.write("folder/nested/한글.txt", b"before")
+        self.write("folder2/untouched.txt", b"sibling")
+        self.core.capture()
+        self.write("folder/nested/한글.txt", b"after")
+        self.write("a.txt", b"also changed")
+        with patch.object(self.core, "read_entry", wraps=self.core.read_entry) as read:
+            snapshot = self.core.capture("automatic", full=False, changed_paths={"folder", "folder/nested", "a.txt"})
+        self.assertEqual({call.args[0] for call in read.call_args_list}, {"folder/nested/한글.txt", "a.txt"})
+        self.assertEqual(self.store.get(snapshot["entries"]["folder/nested/한글.txt"]["hash"]), b"after")
+        self.assertEqual(snapshot["entries"]["folder2/untouched.txt"], self.core.cache["folder2/untouched.txt"][1])
+
+    def test_bounded_worktree_read_rejects_growth_and_shrink_during_read(self):
+        original = os.fstat
+        for content in (b"longer than before", b"x"):
+            self.write("a.txt", b"before")
+            calls = 0
+            def changing(fd):
+                nonlocal calls
+                metadata = original(fd)
+                calls += 1
+                if calls == 1:
+                    self.write("a.txt", content)
+                return metadata
+            with self.subTest(content=content), patch("dev_snapshot.snapshots.os.fstat", side_effect=changing):
+                with self.assertRaises(SafetyError):
+                    self.core.read_entry("a.txt")
+        self.assertEqual(len(self.store.snapshots()), 1)
+
+    def test_periodic_full_hash_detects_missed_same_size_and_mtime_edit(self):
+        target = self.root / "a.txt"
+        before = target.stat()
+        content = b"x" * before.st_size
+        target.write_bytes(content)
+        os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+        session = Session(self.git, self.store, self.config)
+        session.core.cache = dict(self.core.cache)
+        session.full_hashed -= self.config["fullHashSeconds"] + 1
+        self.assertTrue(session.tick())
+        session.worker.join(10)
+        self.assertFalse(session.worker.is_alive())
+        self.assertEqual(session.job["state"], "complete")
+        self.assertEqual(self.store.get(session.core.latest()["entries"]["a.txt"]["hash"]), content)
+
     def test_cached_object_is_recreated_after_ignore_retention_and_allow(self):
         self.write("loose.txt", b"recorded")
         saved = self.core.capture()
@@ -1391,6 +1482,27 @@ service.execute(journal, 'chore: crash boundary', [])
         self.assertEqual(summarize([{"path": "backend/tests/test_core.py", "kind": "added"}]), "테스트 추가")
         self.assertEqual(suggest_commit(["tests/test_auth.py"]), "test: 테스트 수정")
         self.assertEqual(suggest_commit(["src/cart.ts"]), "chore: cart.ts 수정")
+
+    def test_local_summary_uses_saved_function_diff_and_upgrades_old_headers_without_writes(self):
+        self.write("auth.py", b"def validate_login(value):\n    return True\n")
+        self.core.capture()
+        self.write("auth.py", b"def validate_login(value):\n    return bool(value)\n")
+        selected = self.core.capture()
+        self.assertEqual(selected["summary"], "로그인 검증 함수 수정")
+        self.assertEqual(selected["summaryVersion"], 4)
+        selected["summaryVersion"] = 3
+        selected["summary"] = "auth.py 수정"
+        self.store.write_record("snapshots", selected["id"], selected)
+        original = self.store.record("snapshots", selected["id"]).read_bytes()
+        self.store.update_metadata(selected["id"], title="직접 지정한 작업")
+        self.write("auth.py", b"def unrelated_current_file():\n    pass\n")
+        session = Session(self.git, self.store, self.config, git_enabled=False)
+        item = session.timeline()[0]
+        self.assertEqual(item["summary"], "로그인 검증 함수 수정")
+        self.assertEqual(item["metadata"]["title"], "직접 지정한 작업")
+        with patch.object(self.store, "get", side_effect=AssertionError("Cached labels must not reread blobs")):
+            self.assertEqual(session.timeline()[0]["summary"], "로그인 검증 함수 수정")
+        self.assertEqual(self.store.record("snapshots", selected["id"]).read_bytes(), original)
 
     def test_work_title_survives_restart_without_mutating_snapshot(self):
         self.write("src/cart.ts", b"export const count = 1;")

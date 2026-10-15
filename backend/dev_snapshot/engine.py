@@ -13,6 +13,8 @@ from .git import Git
 from .restore import RestoreService, unfinished
 from .snapshots import Policy, SnapshotService, changes_between, snapshot_summary, suggest_commit, summarize
 from .store import Store
+from .agent_history import AgentHistory
+from .local_summary import VERSION as SUMMARY_VERSION
 
 
 def display_bytes(data: bytes | None) -> str:
@@ -31,9 +33,11 @@ def display_bytes(data: bytes | None) -> str:
 
 
 class Session:
-    def __init__(self, git: Git, store: Store, config: dict, *, git_enabled: bool = True):
+    def __init__(self, git: Git, store: Store, config: dict, *, git_enabled: bool = True,
+                 agent_directory: Path | None = None):
         self.git, self.store = git, store
         self.git_enabled = git_enabled
+        self.agent_history = AgentHistory(agent_directory, store.identity, readonly=not store.writable) if agent_directory is not None else None
         self.core = SnapshotService(git, store, config)
         self.dirty: set[str] = set()
         self.restore = RestoreService(self.core, lambda: self.dirty)
@@ -162,6 +166,9 @@ class Session:
                 "branch": latest["context"]["branch"] if latest else None,
                 "excludedCount": latest.get("excludedCount", 0) if latest else 0,
                 "job": dict(self.job) if self.job else None,
+                "agentHistoryEnabled": bool(self.agent_history and self.agent_history.enabled),
+                "agentHistoryPresent": bool(self.agent_history and self.agent_history.present),
+                "agentHistoryProblem": self.agent_history.problem if self.agent_history else "",
                 "recoveries": [j for j in self.store.journals() if unfinished(j)]}
 
     def timeline(self, limit: int = 50) -> list[dict]:
@@ -180,6 +187,12 @@ class Session:
                 range_error = str(error) if isinstance(error, SafetyError) else "Git baseline could not be read. Stored history remains available."
                 context, anchor, baseline = None, None, None
         result = []
+        reports = self.agent_history.records() if self.agent_history else []
+        report_by_tree = {}
+        for report in reports:
+            if report["association"]["status"] == "confirmed":
+                for evidence in report["association"]["evidence"]:
+                    report_by_tree.setdefault((evidence["snapshotId"], evidence["treeHash"]), report)
         visible = [s for s in snapshots if not self.store.is_internal_baseline(s)]
         for s in visible[:max(1, min(limit, 1000))]:
             previous = indexed.get(s["previousSnapshotId"], {})
@@ -191,10 +204,10 @@ class Session:
                 changed_files = len(initial_paths)
             commit_summary, commit_changed_files = None, None
             boundary_state = "unavailable"
-            if s.get("summaryVersion") != 3 and not comparison_pruned and (self.git_enabled or s["reason"] != "initial"):
+            if s.get("summaryVersion") != SUMMARY_VERSION and not comparison_pruned and (self.git_enabled or s["reason"] != "initial"):
                 key = (s["id"], comparison_pruned)
                 if key not in self.work_summaries:
-                    self.work_summaries[key] = snapshot_summary(self.snapshot_changes(s["id"]))
+                    self.work_summaries[key] = snapshot_summary(self.snapshot_changes(s["id"]), self.store)
                 summary = self.work_summaries[key]
             if baseline is not None and s["context"]["branch"] == context["branch"]:
                 if anchor and (s["endedAt"] < anchor["boundaryAt"] or s["endedAt"] == anchor["boundaryAt"] and not anchor.get("partial")):
@@ -211,6 +224,11 @@ class Session:
                            "commitSummary": commit_summary, "commitChangedFiles": commit_changed_files,
                            "comparisonPruned": comparison_pruned,
                            "metadata": self.store.metadata(s["id"]), "context": s["context"]})
+            confirmed = report_by_tree.get((s["id"], s["treeHash"]))
+            if confirmed:
+                result[-1]["agentTitle"] = confirmed["title"]
+                result[-1]["agentDescription"] = confirmed["description"]
+                result[-1]["agentSource"] = "Codex 최종 답변 · 사용자 확인 연결 · 에이전트 보고"
         return result
 
     def snapshot_changes(self, snapshot_id: str) -> list[dict]:
@@ -304,7 +322,10 @@ class Engine:
 
     def tick(self) -> None:
         for repo_id, session in list(self.sessions.items()):
-            if session.tick():
+            changed = session.tick()
+            if session.agent_history and session.agent_history.poll():
+                changed = True
+            if changed:
                 self.notify("changed", {"repositoryId": repo_id})
 
     def close(self) -> None:
@@ -328,7 +349,8 @@ class Engine:
                 return self.sessions[identity["id"]].summary()
             store = Store(Path(params["storageRoot"]).resolve() / "repositories" / identity["id"], identity)
             try:
-                session = Session(git, store, config)
+                session = Session(git, store, config,
+                                  agent_directory=Path(params["storageRoot"]).resolve() / "agent-history" / identity["id"])
                 session.notify = lambda: self.notify("changed", {"repositoryId": identity["id"]})
                 self.sessions[identity["id"]] = session
                 if not session.paused:
@@ -348,7 +370,8 @@ class Engine:
                 if not any(root == r or r.is_relative_to(root) for r in roots):
                     continue
                 store = Store(directory, identity, readonly=True)
-                session = Session(Git(root), store, settings_from(None), git_enabled=False)
+                session = Session(Git(root), store, settings_from(None), git_enabled=False,
+                                  agent_directory=Path(params["storageRoot"]) / "agent-history" / identity["id"])
                 session.message = "Git 비활성 · 과거 기록 조회 전용"
                 self.sessions[identity["id"]] = session
             return [s.summary() for s in self.sessions.values()]
@@ -357,14 +380,36 @@ class Engine:
         session = self.session(params)
         store = session.store
         busy = session.worker is not None and session.worker.is_alive()
-        if busy and method not in ("close", "timeline", "snapshotChanges", "diff", "capture", "pause", "job", "cancelCapture", "settings", "restoreCancel", "historyCancel"):
+        if busy and method not in ("close", "timeline", "snapshotChanges", "diff", "capture", "pause", "job", "cancelCapture", "settings", "restoreCancel", "historyCancel", "agentHistory", "agentConsent", "agentSetup", "agentClear"):
             raise SafetyError("Snapshot capture is running. Wait for completion or pause recording to cancel it.")
         if busy and method == "diff" and params.get("kind", "snapshot") != "snapshot":
             raise SafetyError("Wait for the active capture before reviewing live files.")
-        if not store.writable and method not in ("close", "timeline", "snapshotChanges", "diff", "usage", "pause"):
+        if not store.writable and method not in ("close", "timeline", "snapshotChanges", "diff", "usage", "pause", "agentHistory"):
             raise SafetyError("This session is read-only. Only stored history is available.")
         if not store.writable and method == "diff" and params.get("kind", "snapshot") != "snapshot":
             raise SafetyError("Read-only sessions can only compare stored snapshots.")
+        if method.startswith("agent"):
+            history = session.agent_history
+            if history is None:
+                raise SafetyError("Agent history storage is unavailable.")
+            if method == "agentHistory":
+                return history.records()[:max(1, min(int(params.get("limit", 50)), 500))]
+            if method in ("agentConsent", "agentClear", "agentLink") and params.get("approved") is not True:
+                raise SafetyError("Explicit approval is required for agent history changes.")
+            if method == "agentConsent":
+                history.consent(params["enabled"])
+            elif method == "agentSetup":
+                return history.setup(params["python"], params["script"])
+            elif method == "agentClear":
+                history.clear()
+            elif method == "agentLinkReview":
+                return history.review_link(params["messageId"], params["snapshotIds"], store)
+            elif method == "agentLink":
+                history.link(params["messageId"], params["snapshotIds"], params["reviewHash"], store)
+            else:
+                raise SafetyError("Unknown agent history method.")
+            self.notify("changed", {"repositoryId": store.identity["id"]})
+            return None
         if method == "close":
             session.core.cancelled.set()
             if session.worker:
@@ -486,7 +531,7 @@ class Engine:
             snapshots = []
             for s in store.snapshots():
                 internal = store.is_internal_baseline(s)
-                fallback_title = "이전 내부 비교 기준" if internal else "기존 미커밋 작업" if s["reason"] == "initial" else s.get("summary", "복구 백업" if s["reason"] == "backup" else "저장된 파일 상태")
+                fallback_title = "이전 내부 비교 기준" if internal else s.get("summary", "복구 백업" if s["reason"] == "backup" else "저장된 파일 상태")
                 snapshots.append({"id": s["id"], "endedAt": s["endedAt"], "reason": s["reason"],
                                   "internalBaseline": internal, "protected": s["id"] in protected,
                                   "title": store.metadata(s["id"]).get("title") or fallback_title, "context": s["context"]})

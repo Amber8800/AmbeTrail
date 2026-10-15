@@ -1,26 +1,29 @@
 import * as vscode from 'vscode';
 import { randomBytes } from 'node:crypto';
 import { branchColor, branchLabel, compactTime } from './presentation';
-import { Change, Journal, Repository, SnapshotItem } from './protocol';
+import { AgentReport, Change, Journal, Repository, SnapshotItem } from './protocol';
 
 export interface TimelineNode extends vscode.TreeItem {
-  readonly kind: 'repository' | 'snapshot' | 'file' | 'message' | 'recovery' | 'more';
+  readonly kind: 'repository' | 'snapshot' | 'file' | 'message' | 'recovery' | 'more' | 'agent';
   readonly repository?: Repository;
   readonly snapshot?: SnapshotItem;
   readonly change?: Change;
   readonly journal?: Journal;
   readonly commitIncluded?: boolean;
   readonly commitOnly?: boolean;
+  readonly agentReport?: AgentReport;
 }
 interface TimelineSource {
+  readonly showAgentReports?: boolean;
   readonly onDidChangeTreeData: vscode.Event<TimelineNode | undefined>;
   getChildren(item?: TimelineNode): Promise<TimelineNode[]>;
 }
 
 const actions: Record<TimelineNode['kind'], readonly string[]> = {
-  repository: ['captureNow', 'refresh', 'manageHistory', 'pauseRecording', 'resumeRecording'],
+  repository: ['captureNow', 'refresh', 'manageHistory', 'pauseRecording', 'resumeRecording', 'agentHistorySettings'],
   snapshot: ['openDiff', 'prepareCommit', 'restoreSnapshot', 'renameSnapshot', 'pinSnapshot', 'deleteSnapshot'],
   file: ['openDiff', 'toggleCommitFile'], recovery: ['recover'], more: ['more'], message: [],
+  agent: ['agentReportDetails', 'linkAgentReport', 'openAgentSnapshots'],
 };
 
 /** The webview only sends opaque item IDs. All actions use host-owned objects and existing reviewed commands. */
@@ -71,6 +74,8 @@ export class TimelineView implements vscode.WebviewViewProvider, vscode.Disposab
         writable: node.repository.writable, paused: node.repository.paused,
         branch: node.repository.branch?.replace(/^refs\/heads\//, '') || '브랜치 없음',
         status: node.repository.status, dirtyCount: node.repository.dirtyCount, excludedCount: node.repository.excludedCount,
+        agentHistoryEnabled: node.repository.agentHistoryEnabled, agentHistoryProblem: node.repository.agentHistoryProblem,
+        showAgentReports: this.source.showAgentReports === true,
       } : {}),
       ...(node.kind === 'snapshot' && snapshot ? {
         endedAt: snapshot.endedAt, time: compactTime(snapshot.endedAt), branch: branchLabel(snapshot.context),
@@ -78,6 +83,11 @@ export class TimelineView implements vscode.WebviewViewProvider, vscode.Disposab
         changedFiles: snapshot.changedFiles, pinned: snapshot.metadata.pinned, committed: snapshot.boundaryState === 'committed', partial: snapshot.boundaryState === 'partial',
         summary: snapshot.summary, rangeError: snapshot.rangeError, comparisonPruned: snapshot.comparisonPruned,
         commitSummary: snapshot.commitSummary, commitChangedFiles: snapshot.commitChangedFiles,
+        agentDescription: snapshot.agentDescription, agentSource: snapshot.agentSource,
+      } : {}),
+      ...(node.kind === 'agent' && node.agentReport ? {
+        collectedAt: node.agentReport.collectedAt, reportDescription: node.agentReport.description,
+        association: node.agentReport.association.status, linkedCount: node.agentReport.association.evidence.length,
       } : {}),
       ...(node.kind === 'file' && node.change ? { path: node.change.path, change: node.change.kind || 'modified', commitIncluded: node.commitIncluded, commitOnly: node.commitOnly } : {}),
     };

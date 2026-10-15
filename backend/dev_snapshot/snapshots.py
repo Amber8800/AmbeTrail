@@ -14,6 +14,7 @@ from .common import (ABSENT, SafetyError, digest, metadata_is_link, new_id, rela
                      safe_path, sha, signature, utc_now)
 from .git import Git, same_context
 from .store import Store, protect_backup
+from .local_summary import VERSION as SUMMARY_VERSION, describe
 
 SENSITIVE = (".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa", "id_ed25519", ".npmrc", ".pypirc")
 
@@ -97,8 +98,11 @@ class SnapshotService:
                 opened = os.fstat(stream.fileno())
                 if not stat.S_ISREG(opened.st_mode) or signature(opened) != sig:
                     raise SafetyError("File changed while being read.")
-                data = stream.read(int(self.config["maxFileMiB"] * 1024 * 1024) + 1)
-                if len(data) > self.config["maxFileMiB"] * 1024 * 1024 or signature(os.fstat(stream.fileno())) != sig:
+                # Bound the allocation by the observed size, retaining one byte to
+                # detect growth along with the existing descriptor/path checks.
+                limit = int(self.config["maxFileMiB"] * 1024 * 1024)
+                data = stream.read(min(before.st_size, limit) + 1)
+                if len(data) != before.st_size or len(data) > limit or signature(os.fstat(stream.fileno())) != sig:
                     raise SafetyError("File changed while being read.")
             if signature(target.lstat()) != sig:
                 raise SafetyError("File changed while being read.")
@@ -159,7 +163,13 @@ class SnapshotService:
             incremental = changed_paths is not None and same_epoch and not full
             affected = set()
             if incremental:
-                affected = {p for p in names if p in changed_paths or any(p.startswith(changed + "/") for changed in changed_paths)}
+                for name in names:
+                    ancestor = name
+                    while ancestor:
+                        if ancestor in changed_paths:
+                            affected.add(name)
+                            break
+                        ancestor = ancestor.rpartition("/")[0]
             try:
                 to_read = []
                 for name in names:
@@ -226,8 +236,8 @@ class SnapshotService:
                     snapshot["initialChanges"] = initial_changes
                     snapshot["initialBefore"] = initial_before
                     changes = initial_diff
-                snapshot["summary"] = snapshot_summary(changes)
-                snapshot["summaryVersion"] = 3
+                snapshot["summary"] = snapshot_summary(changes, self.store)
+                snapshot["summaryVersion"] = SUMMARY_VERSION
                 snapshot["changedFiles"] = len(initial_changes) if initial_changes is not None else len(changes)
                 self.store.save_snapshot(snapshot)
                 return snapshot
@@ -264,10 +274,13 @@ def changes_between(before: dict, after: dict) -> list[dict]:
     return changes
 
 
-def snapshot_summary(changes: list[dict]) -> str:
-    """Label one capture using its actual changed paths, independent of Git commit boundaries."""
+def snapshot_summary(changes: list[dict], store: Store | None = None) -> str:
+    """Label one capture from saved changes, independent of Git commit boundaries."""
     if not changes:
         return "파일 변경 없음"
+    detailed = describe(changes, store.get) if store is not None else None
+    if detailed:
+        return detailed
     names = [c["path"].rsplit("/", 1)[-1] for c in changes]
     repeated = {name for name, count in Counter(names).items() if count > 1}
     labels = []

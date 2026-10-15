@@ -7,7 +7,7 @@ import { EventEmitter } from 'node:events';
 import { runInNewContext } from 'node:vm';
 import type * as vscode from 'vscode';
 import { branchColor, branchLabel, snapshotContext } from '../src/presentation';
-import { Change, GitContext, Repository, SnapshotItem } from '../src/protocol';
+import { AgentReport, Change, GitContext, Repository, SnapshotItem } from '../src/protocol';
 
 const context: GitContext = { branch: 'refs/heads/main', head: 'abcdef0123456789', indexHash: '', busy: false, sparse: false };
 function snapshot(id: string, overrides: Partial<SnapshotItem> = {}): SnapshotItem {
@@ -24,6 +24,7 @@ async function harness(snapshots = [snapshot('selected')], workspaceValues = new
     warnings: [] as string[], messages: [] as string[], errors: [] as string[], calls: [] as { method: string; params: Record<string, unknown> }[],
     picks: [] as unknown[], pickItems: [] as { label: string; detail?: string }[][], deleteError: undefined as Error | undefined,
     commitChanges: undefined as Change[] | undefined, documents: [] as string[], input: undefined as string | undefined, workspaceValues,
+    agentReports: [] as AgentReport[], showAgentReports: false,
   };
   let provider: vscode.TreeDataProvider<vscode.TreeItem> | undefined;
   let webviewProvider: { source: typeof provider; resolveWebviewView(view: unknown): void; dispose(): void };
@@ -47,6 +48,10 @@ async function harness(snapshots = [snapshot('selected')], workspaceValues = new
       if (method === 'list') return [repo];
       if (method === 'timeline') return state.snapshots;
       if (method === 'snapshotChanges') return state.changes;
+      if (method === 'agentHistory') return state.agentReports;
+      if (method === 'agentConsent') { repo.agentHistoryEnabled = params.enabled as boolean; repo.agentHistoryPresent = true; }
+      if (method === 'agentSetup') return { hooks: { Stop: [{ hooks: [{ type: 'command', command: 'python codex_hook.py' }] }] } };
+      if (method === 'agentLinkReview') return { messageId: params.messageId, title: '에이전트 보고', evidence: [{ snapshotId: 'selected', treeHash: 'tree', context, changedFiles: 1, changedPaths: ['app.py'] }], reviewHash: 'agent-review' };
       if (method === 'commitBoundaryReview') {
         const available = state.commitChanges ?? state.changes;
         const changes = params.selected === undefined ? available : available.filter(c => (params.selected as string[]).includes(c.path));
@@ -79,7 +84,7 @@ async function harness(snapshots = [snapshot('selected')], workspaceValues = new
     },
     workspace: {
       isTrusted: true, workspaceFolders: [], textDocuments: [],
-      getConfiguration: () => ({ inspect: () => undefined }), registerTextDocumentContentProvider: event,
+      getConfiguration: () => ({ inspect: () => undefined, get: (key: string, fallback: unknown) => key === 'showAgentReports' ? state.showAgentReports : fallback }), registerTextDocumentContentProvider: event,
       onDidSaveTextDocument: event, onDidChangeTextDocument: event, onDidCloseTextDocument: event, onDidChangeConfiguration: event,
     },
     window: {
@@ -253,6 +258,81 @@ test('webview serializes host data safely, lazily loads files and only runs allo
 function changed(path: string): Change {
   return { path, kind: 'added', before: { state: 'absent' }, after: { state: 'present', hash: '', size: 1, executable: false } };
 }
+
+function agentReport(): AgentReport {
+  return { id: 'report', title: '<script>alert(1)</script>', description: '로그인과 회원가입 구현 · 에이전트 보고',
+    source: 'codex-stop', phase: 'final_answer', occurredAt: null, collectedAt: '2026-10-15T03:00:00Z',
+    sessionId: 'session', turnId: 'turn', association: { status: 'unlinked', evidence: [] } };
+}
+
+test('agent reports remain unlinked text beside snapshots and cannot invoke Git actions', async t => {
+  const h = await harness(); t.after(h.stop);
+  h.state.showAgentReports = true;
+  h.repo.agentHistoryPresent = true; h.state.agentReports = [agentReport()]; h.openView();
+  await h.message({ type: 'ready' });
+  const records = h.viewMessages.find(m => m.type === 'state')!.repositories[0].children;
+  const report = records.find((r: any) => r.kind === 'agent');
+  assert.equal(report.label, '<script>alert(1)</script>');
+  assert.equal(report.association, 'unlinked');
+  assert.equal(records.filter((r: any) => r.kind === 'snapshot').length, 1);
+  await h.message({ type: 'action', id: report.id, action: 'prepareCommit' });
+  await h.message({ type: 'action', id: report.id, action: 'restoreSnapshot' });
+  assert.equal(h.state.warnings.length, 0);
+  await h.message({ type: 'action', id: report.id, action: 'agentReportDetails' });
+  assert.match(h.state.documents[0]!, /원본 발생 시각은 Hook이 제공하지 않습니다/);
+});
+
+test('agent consent cancellation does not enable collection or produce setup', async t => {
+  const h = await harness(); t.after(h.stop);
+  h.state.picks = ['이 저장소의 최종 답변 수집 허용'];
+  await h.command('devSnapshot.agentHistorySettings');
+  assert.equal(h.state.calls.filter(c => c.method === 'agentConsent' || c.method === 'agentSetup').length, 0);
+  h.state.picks = ['이 저장소의 최종 답변 수집 허용']; h.state.warningChoice = '이 저장소 수집 허용';
+  await h.command('devSnapshot.agentHistorySettings');
+  assert.equal(h.state.calls.find(c => c.method === 'agentConsent')!.params.approved, true);
+  assert.match(h.state.documents[0]!, /이 예시는 설정을 설치하지 않습니다/);
+  assert.match(h.state.documents[0]!, /중간 메시지는 지원하지 않습니다/);
+});
+
+test('agent link needs code review and explicit confirmation and preserves commit selection', async t => {
+  const h = await harness(); t.after(h.stop);
+  h.state.showAgentReports = true;
+  h.repo.agentHistoryPresent = true; h.state.agentReports = [agentReport()];
+  const [repo] = await h.children();
+  const report = (await h.children(repo)).find(r => (r as any).kind === 'agent')!;
+  h.state.picks = [[{ snapshot: h.state.snapshots[0] }]];
+  await h.command('devSnapshot.linkAgentReport', report);
+  assert.equal(h.state.calls.filter(c => c.method === 'agentLink').length, 0);
+  assert.match(h.state.documents[0]!, /app.py/);
+  h.state.picks = [[{ snapshot: h.state.snapshots[0] }]]; h.state.warningChoice = '검토한 기록에 연결';
+  await h.command('devSnapshot.linkAgentReport', report);
+  const linked = h.state.calls.find(c => c.method === 'agentLink')!;
+  assert.equal(linked.params.reviewHash, 'agent-review');
+  assert.equal(linked.params.approved, true);
+  assert.equal(h.state.calls.filter(c => c.method === 'commitPrepare').length, 0);
+});
+
+test('local snapshot summaries take precedence over agent reports and user titles override both', async t => {
+  const h = await harness([snapshot('selected', { agentTitle: '에이전트 제목', metadata: { pinned: false, validation: 'unverified', commitIds: [] } })]); t.after(h.stop);
+  const [repo] = await h.children();
+  assert.equal((await h.children(repo))[0]!.label, 'a.txt 수정');
+  h.state.snapshots[0]!.metadata.title = '사용자 제목';
+  assert.equal((await h.children(repo))[0]!.label, '사용자 제목');
+  assert.equal(h.state.snapshots[0]!.summary, 'a.txt 수정');
+});
+
+test('local naming shows initial summaries and requires no agent report collection or linking', async t => {
+  const h = await harness([snapshot('initial', { reason: 'initial', summary: '로그인 검증 함수 수정',
+    metadata: { pinned: false, validation: 'unverified', commitIds: [] } })]); t.after(h.stop);
+  h.repo.agentHistoryPresent = true; h.state.agentReports = [agentReport()];
+  const [repo] = await h.children(); const children = await h.children(repo);
+  assert.equal(children[0]!.label, '로그인 검증 함수 수정');
+  assert.equal(children.length, 1);
+  assert.equal(h.state.calls.some(c => c.method.startsWith('agent')), false);
+  h.openView(); await h.message({ type: 'ready' });
+  assert.equal(h.viewMessages.find(m => m.type === 'state')!.repositories[0].showAgentReports, false);
+  assert.equal(h.state.warnings.length, 0);
+});
 
 test('commit file toggles include earlier pending docs and persist across refresh and restart', async t => {
   const records = [snapshot('selected', { boundaryState: 'ready' })];

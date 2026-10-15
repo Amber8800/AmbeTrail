@@ -5,7 +5,10 @@
 !media/timeline.js
 !package.json
 !backend/run.py
+!backend/codex_hook.py
 !backend/dev_snapshot/*.py
 !README.md
 !LICENSE
 !CHANGELOG.md
+!docs/codex-history.md
+!docs/performance-2026-10-15.md

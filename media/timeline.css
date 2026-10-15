@@ -90,3 +90,6 @@ code { font: 10px var(--vscode-editor-font-family, monospace); }
 @media (prefers-reduced-motion: no-preference) { button, .record > details { transition: background-color .12s ease, border-color .12s ease; } }
 @media (max-width: 240px) { .topbar { flex-wrap: wrap; } .repository { padding-left: 10px; padding-right: 10px; } .record-title { flex-wrap: wrap; } }
 body.vscode-high-contrast button, body.vscode-high-contrast-light button { border-color: var(--vscode-contrastBorder); }
+/* Agent reports remain text-only metadata beside the existing file records. */
+.agent-report { border-left-color: var(--vscode-descriptionForeground); }
+.agent-excerpt { white-space: pre-wrap; overflow-wrap: anywhere; }
