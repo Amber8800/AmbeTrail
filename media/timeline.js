@@ -9,6 +9,7 @@
   let repositories = [];
   let menu;
   let busy = false;
+  let managementDialog;
 
   function element(tag, className, text) {
     const node = document.createElement(tag);
@@ -107,6 +108,7 @@
       button('복원', 'restoreSnapshot', snapshot, 'secondary', !repo.writable),
       button('커밋', 'prepareCommit', snapshot, 'primary', !repo.writable || snapshot.committed));
     body.append(context, actions);
+    if (repo.showAgentReports && snapshot.agentSource) body.append(element('p', 'hint', snapshot.agentSource), element('p', 'agent-excerpt', snapshot.agentDescription || ''));
     if (snapshot.commitSummary && snapshot.commitChangedFiles != null && !snapshot.committed) body.append(element('p', 'hint', `커밋 구간: ${snapshot.commitSummary} · 파일 ${snapshot.commitChangedFiles}개`));
     if (snapshot.comparisonPruned) body.append(element('p', 'hint', '이전 비교 기록이 삭제되어 포함 파일 기준으로 표시합니다.'));
     if (snapshot.rangeError) body.append(element('p', 'hint', '커밋 구간을 계산할 수 없습니다. 자세한 내용은 기록에 마우스를 올려 확인하세요.'));
@@ -123,6 +125,112 @@
     if (details.open) { populateFiles(body, snapshot); send('expand', snapshot.id); }
     return row;
   }
+  function agentRecord(report, repo) {
+    const row = element('article', 'record agent-report'); row.dataset.id = report.id;
+    const details = element('details'); details.open = expanded.has(report.id);
+    const summary = element('summary'); summary.title = report.tooltip;
+    const heading = element('div', 'record-title');
+    heading.append(element('strong', '', report.label), element('time', '', new Date(report.collectedAt).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', hour12: false })));
+    summary.append(heading, element('p', 'record-meta', report.description));
+    const body = element('div', 'details-body');
+    body.append(element('p', 'agent-excerpt', report.reportDescription || ''), element('p', 'hint', '수집 시각 기준 · 에이전트 보고 · 작성자 및 테스트 성공 미검증'));
+    const actions = element('div', 'actions');
+    actions.append(button('상세 설명', 'agentReportDetails', report, 'secondary'), button('연결 검토', 'linkAgentReport', report, 'secondary', !repo.writable));
+    if (report.linkedCount) actions.append(button('연결된 기록', 'openAgentSnapshots', report, 'secondary'));
+    body.append(actions); details.append(summary, body); row.append(details);
+    details.addEventListener('toggle', () => {
+      if (details.open) expanded.add(report.id); else expanded.delete(report.id);
+      vscode.setState({ expanded: [...expanded], scroll: window.scrollY });
+    });
+    return row;
+  }
+  function closeManagement() {
+    if (!managementDialog || managementDialog.busy) return;
+    const id = managementDialog.id;
+    managementDialog.element.close(); managementDialog.element.remove(); managementDialog = undefined;
+    send('managementClose', id);
+    const row = [...app.querySelectorAll('[data-id]')].find(node => node.dataset.id === id);
+    [...(row?.querySelectorAll('button') || [])].find(node => node.textContent === '관리')?.focus();
+  }
+  function managementBusy(value) {
+    if (!managementDialog) return;
+    managementDialog.busy = value;
+    for (const control of managementDialog.element.querySelectorAll('input, select, button')) {
+      control.disabled = value || control.dataset.locked === 'true';
+    }
+  }
+  function managementRequest(type, extra = {}) {
+    if (!managementDialog || managementDialog.busy) return;
+    managementDialog.pendingFocus = document.activeElement.dataset.focus;
+    managementBusy(true); managementDialog.status.className = 'dialog-status';
+    managementDialog.status.textContent = '처리 중…';
+    vscode.postMessage({ type, id: managementDialog.id, ...extra });
+  }
+  function renderManagement(id, state, noticeText = '') {
+    const focused = managementDialog?.pendingFocus || (managementDialog?.element.contains(document.activeElement) ? document.activeElement.dataset.focus : undefined);
+    if (managementDialog) { managementDialog.element.close(); managementDialog.element.remove(); }
+    const dialog = element('dialog', 'management-dialog'); dialog.setAttribute('aria-labelledby', 'management-title');
+    const header = element('div', 'dialog-header');
+    const title = element('h2', '', '기록 관리'); title.id = 'management-title';
+    const close = element('button', 'quiet dialog-close', '×'); close.type = 'button'; close.dataset.focus = 'close';
+    close.setAttribute('aria-label', '관리 창 닫기'); close.addEventListener('click', closeManagement); header.append(title, close);
+    const description = element('p', 'hint', state.name + (state.writable ? '' : ' · 읽기 전용'));
+    const status = element('p', 'dialog-status', noticeText); status.tabIndex = -1;
+    status.setAttribute('role', 'status'); status.setAttribute('aria-live', 'polite');
+    managementDialog = { element: dialog, id, status, busy: false };
+    const form = element('form', 'recording-form'); form.noValidate = true;
+    form.append(element('h3', '', '기록 주기'));
+    const inputs = new Map();
+    for (const field of state.recording) {
+      const label = element('label', 'recording-field'); label.append(element('span', 'field-title', field.label));
+      const controls = element('span', 'field-control');
+      const input = element('input'); input.type = 'number'; input.name = field.key; input.dataset.focus = field.key;
+      input.min = String(field.step); input.max = String(field.maximum); input.step = String(field.step); input.value = String(field.value);
+      input.disabled = !state.writable; input.dataset.locked = String(!state.writable);
+      const help = element('span', 'hint field-help', field.detail); help.id = `management-${field.key}-help`;
+      input.setAttribute('aria-describedby', help.id); inputs.set(field.key, input);
+      controls.append(input, element('span', 'field-unit', field.unit)); label.append(controls, help); form.append(label);
+    }
+    const footer = element('div', 'dialog-actions');
+    const save = element('button', 'primary', '주기 저장'); save.type = 'submit'; save.dataset.focus = 'save';
+    save.disabled = !state.writable; save.dataset.locked = String(!state.writable);
+    const cancel = element('button', 'secondary', '닫기'); cancel.type = 'button'; cancel.dataset.focus = 'cancel'; cancel.addEventListener('click', closeManagement);
+    footer.append(save, cancel); form.append(footer);
+    form.addEventListener('submit', event => {
+      event.preventDefault();
+      managementRequest('saveRecording', { values: Object.fromEntries([...inputs].map(([key, input]) => [key, input.value])) });
+    });
+    const history = element('section', 'dialog-history'); history.append(element('h3', '', '기록 및 저장 공간'));
+    history.append(element('p', 'hint', `${(state.usage.bytes / 1048576).toFixed(1)} / ${(state.usage.limit / 1048576).toFixed(0)} MiB 사용 · 기록 ${state.usage.snapshots.length}개`));
+    const actions = element('div', 'dialog-actions');
+    for (const [text, action] of [[state.paused ? '자동 기록 재개' : '자동 기록 일시 중지', state.paused ? 'resume' : 'pause'], ['보존 정책으로 정리', 'prune']]) {
+      const button = element('button', 'secondary', text); button.type = 'button'; button.dataset.focus = action;
+      button.disabled = !state.writable; button.dataset.locked = String(!state.writable);
+      button.addEventListener('click', () => managementRequest('managementAction', { action })); actions.append(button);
+    }
+    history.append(actions);
+    const deletion = element('label', 'recording-field'); deletion.append(element('span', 'field-title', '스냅샷 삭제'));
+    const select = element('select'); select.dataset.focus = 'snapshot';
+    const empty = element('option', '', '삭제할 기록을 선택하세요'); empty.value = ''; select.append(empty);
+    for (const snapshot of state.usage.snapshots) {
+      const option = element('option', '', `${snapshot.protected ? '[보호됨] ' : ''}${snapshot.title} · ${new Date(snapshot.endedAt).toLocaleString()}`);
+      option.value = snapshot.id; option.disabled = snapshot.protected; select.append(option);
+    }
+    select.disabled = !state.writable; select.dataset.locked = String(!state.writable); deletion.append(select);
+    const remove = element('button', 'danger secondary', '선택한 기록 삭제'); remove.type = 'button'; remove.dataset.focus = 'delete';
+    remove.disabled = true; remove.dataset.locked = 'true';
+    select.addEventListener('change', () => { remove.dataset.locked = String(!state.writable || !select.value); remove.disabled = managementDialog.busy || remove.dataset.locked === 'true'; });
+    remove.addEventListener('click', () => managementRequest('managementAction', { action: 'delete', snapshotId: select.value }));
+    history.append(deletion, remove, element('p', 'hint', '보호된 기록은 삭제할 수 없습니다. 삭제 전 최종 확인 창이 표시됩니다.'));
+    dialog.append(header, description, status, form, history);
+    dialog.addEventListener('cancel', event => { event.preventDefault(); closeManagement(); });
+    dialog.addEventListener('click', event => {
+      const bounds = dialog.getBoundingClientRect();
+      if (event.target === dialog && (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom)) closeManagement();
+    });
+    document.body.append(dialog); dialog.showModal();
+    if (focused) [...dialog.querySelectorAll('[data-focus]')].find(node => node.dataset.focus === focused)?.focus();
+  }
   function render() {
     const focused = document.activeElement;
     const focusRecord = focused?.closest('[data-id]')?.dataset.id;
@@ -130,7 +238,7 @@
     const scroll = window.scrollY;
     closeMenu(); app.replaceChildren();
     const header = element('header', 'topbar');
-    const title = element('div'); title.append(element('h1', '', '작업 타임라인'), element('p', '', '기록을 펼쳐 변경을 확인하세요'));
+    const title = element('div'); title.append(element('h1', '', 'AmberTrail'), element('p', '', '작업 타임라인'));
     header.append(title);
     const first = repositories.find(repo => repo.kind === 'repository');
     if (first) header.append(button('새 기록', 'captureNow', first, 'primary', !first.writable));
@@ -138,22 +246,26 @@
     for (const repo of repositories) {
       if (repo.kind !== 'repository') { app.append(element('p', 'empty', repo.label)); continue; }
       const section = element('section', 'repository'); section.dataset.id = repo.id;
-      const heading = element('div', 'repo-heading'); heading.append(element('h2', '', repo.label), button('관리', 'manageHistory', repo, 'quiet'));
+      const heading = element('div', 'repo-heading'); heading.append(element('h2', '', `저장소 · ${repo.label}`), button('관리', 'manageHistory', repo, 'quiet'));
       const meta = element('div', 'repo-meta');
       const attention = repo.writable && !repo.paused && repo.status && !repo.status.startsWith('기록 중');
       meta.append(element('span', `recording${repo.paused || !repo.writable ? ' paused' : attention ? ' attention' : ''}`, !repo.writable ? '읽기 전용' : repo.paused ? '일시 중지' : attention ? repo.status : '자동 기록 중'), element('span', 'repo-branch', repo.branch));
       const toolbar = element('div', 'repo-toolbar'); toolbar.append(button('새로고침', 'refresh', repo, 'quiet'));
+      if (repo.writable && repo.showAgentReports) toolbar.append(button(repo.agentHistoryEnabled ? 'Codex 연동 관리' : 'Codex 연동 설정', 'agentHistorySettings', repo, 'quiet'));
       if (repo.writable) toolbar.append(button(repo.paused ? '기록 재개' : '일시 중지', repo.paused ? 'resumeRecording' : 'pauseRecording', repo, 'quiet'));
       if (repositories.filter(r => r.kind === 'repository').length > 1) toolbar.append(button('새 기록', 'captureNow', repo, 'quiet', !repo.writable));
       section.append(heading, meta, toolbar);
+      section.append(element('p', 'hint', '저장된 변경 내용을 로컬에서 분석해 작업 이름을 자동 생성합니다.'));
+      if (repo.showAgentReports && repo.agentHistoryProblem) section.append(element('p', 'hint', repo.agentHistoryProblem));
       if (repo.status?.startsWith('기록 중 ·')) section.append(element('p', 'hint', repo.status));
       if (repo.dirtyCount || repo.excludedCount) section.append(element('p', 'hint', [repo.dirtyCount ? `미저장 편집 ${repo.dirtyCount}개` : '', repo.excludedCount ? `제외 파일 ${repo.excludedCount}개` : ''].filter(Boolean).join(' · ')));
       let day;
       for (const item of repo.children) {
-        if (item.kind === 'snapshot') {
-          const nextDay = new Date(item.endedAt).toDateString();
-          if (nextDay !== day) { section.append(element('h3', 'day-heading', dateLabel(item.endedAt))); day = nextDay; }
-          section.append(record(item, repo));
+        if (item.kind === 'snapshot' || item.kind === 'agent') {
+          const date = item.kind === 'agent' ? item.collectedAt : item.endedAt;
+          const nextDay = new Date(date).toDateString();
+          if (nextDay !== day) { section.append(element('h3', 'day-heading', dateLabel(date))); day = nextDay; }
+          section.append(item.kind === 'agent' ? agentRecord(item, repo) : record(item, repo));
         } else if (item.kind === 'recovery') section.append(button(item.label, 'recover', item, 'recovery'));
         else if (item.kind === 'more') section.append(button('이전 기록 더 보기', 'more', item, 'more secondary'));
         else section.append(element('p', 'empty', item.label));
@@ -176,6 +288,15 @@
       children.set(value.id, value.children);
       const row = [...app.querySelectorAll('[data-id]')].find(node => node.dataset.id === value.id);
       if (row) populateFiles(row.querySelector('.details-body'), { id: value.id });
+    } else if (value.type === 'management') {
+      busy = false; notice.textContent = ''; render();
+      renderManagement(value.id, value.state, value.notice);
+    } else if (value.type === 'managementError') {
+      if (managementDialog?.id === value.id) {
+        managementBusy(false); managementDialog.status.className = 'dialog-status dialog-error';
+        managementDialog.status.textContent = value.message;
+        managementDialog.status.focus();
+      }
     } else if (value.type === 'error') {
       busy = false; notice.textContent = value.message;
       if (value.id) { children.set(value.id, { error: value.message }); const row = [...app.querySelectorAll('[data-id]')].find(node => node.dataset.id === value.id); if (row) populateFiles(row.querySelector('.details-body'), { id: value.id }); }

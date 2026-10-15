@@ -1,26 +1,33 @@
 import * as vscode from 'vscode';
 import { randomBytes } from 'node:crypto';
 import { branchColor, branchLabel, compactTime } from './presentation';
-import { Change, Journal, Repository, SnapshotItem } from './protocol';
+import { AgentReport, Change, Journal, Repository, SnapshotItem } from './protocol';
+import { ManagementState } from './management';
 
 export interface TimelineNode extends vscode.TreeItem {
-  readonly kind: 'repository' | 'snapshot' | 'file' | 'message' | 'recovery' | 'more';
+  readonly kind: 'repository' | 'snapshot' | 'file' | 'message' | 'recovery' | 'more' | 'agent';
   readonly repository?: Repository;
   readonly snapshot?: SnapshotItem;
   readonly change?: Change;
   readonly journal?: Journal;
   readonly commitIncluded?: boolean;
   readonly commitOnly?: boolean;
+  readonly agentReport?: AgentReport;
 }
 interface TimelineSource {
+  readonly showAgentReports?: boolean;
   readonly onDidChangeTreeData: vscode.Event<TimelineNode | undefined>;
   getChildren(item?: TimelineNode): Promise<TimelineNode[]>;
+  management(repo: Repository): Promise<ManagementState>;
+  saveRecording(repo: Repository, values: unknown): Promise<void>;
+  manageAction(repo: Repository, action: 'pause' | 'resume' | 'prune' | 'delete', snapshotId?: string): Promise<void>;
 }
 
 const actions: Record<TimelineNode['kind'], readonly string[]> = {
-  repository: ['captureNow', 'refresh', 'manageHistory', 'pauseRecording', 'resumeRecording'],
+  repository: ['captureNow', 'refresh', 'manageHistory', 'pauseRecording', 'resumeRecording', 'agentHistorySettings'],
   snapshot: ['openDiff', 'prepareCommit', 'restoreSnapshot', 'renameSnapshot', 'pinSnapshot', 'deleteSnapshot'],
   file: ['openDiff', 'toggleCommitFile'], recovery: ['recover'], more: ['more'], message: [],
+  agent: ['agentReportDetails', 'linkAgentReport', 'openAgentSnapshots'],
 };
 
 /** The webview only sends opaque item IDs. All actions use host-owned objects and existing reviewed commands. */
@@ -31,6 +38,9 @@ export class TimelineView implements vscode.WebviewViewProvider, vscode.Disposab
   private timer?: NodeJS.Timeout;
   private readonly subscription: vscode.Disposable;
   private viewSubscriptions: vscode.Disposable[] = [];
+  private managedRepository?: string;
+  private managedSnapshots = new Set<string>();
+  private managementBusy = false;
 
   constructor(readonly source: TimelineSource, private readonly extensionUri: vscode.Uri) {
     this.subscription = source.onDidChangeTreeData(() => {
@@ -40,6 +50,7 @@ export class TimelineView implements vscode.WebviewViewProvider, vscode.Disposab
 
   resolveWebviewView(view: vscode.WebviewView): void {
     this.viewSubscriptions.forEach(d => d.dispose());
+    this.managedRepository = undefined; this.managedSnapshots.clear();
     this.view = view;
     const media = vscode.Uri.joinPath(this.extensionUri, 'media');
     view.webview.options = { enableScripts: true, localResourceRoots: [media] };
@@ -55,8 +66,23 @@ export class TimelineView implements vscode.WebviewViewProvider, vscode.Disposab
     this.viewSubscriptions = [
       view.webview.onDidReceiveMessage(message => { void this.receive(message); }),
       view.onDidChangeVisibility(() => { if (view.visible) void this.update(); }),
-      view.onDidDispose(() => { if (this.view === view) { this.view = undefined; this.generation++; this.nodes.clear(); } }),
+      view.onDidDispose(() => { if (this.view === view) { this.view = undefined; this.generation++; this.nodes.clear(); this.managedRepository = undefined; this.managedSnapshots.clear(); } }),
     ];
+  }
+
+  async openManagement(repositoryId: string): Promise<void> {
+    await vscode.commands.executeCommand('devSnapshot.timeline.focus');
+    await this.update();
+    const entry = [...this.nodes.entries()].find(([, node]) => node.kind === 'repository' && node.repository?.id === repositoryId);
+    if (!entry || !this.view?.visible) throw new Error('AmberTrail 작업 기록 패널을 연 뒤 다시 시도하세요.');
+    await this.managementState(entry[0], entry[1]);
+  }
+
+  private async managementState(id: string, node: TimelineNode, notice = ''): Promise<void> {
+    const state = await this.source.management(node.repository!);
+    this.managedRepository = id;
+    this.managedSnapshots = new Set(state.usage.snapshots.map(snapshot => snapshot.id));
+    await this.view?.webview.postMessage({ type: 'management', id, state, notice });
   }
 
   private serialize(node: TimelineNode, nodes: Map<string, TimelineNode>): object {
@@ -71,6 +97,8 @@ export class TimelineView implements vscode.WebviewViewProvider, vscode.Disposab
         writable: node.repository.writable, paused: node.repository.paused,
         branch: node.repository.branch?.replace(/^refs\/heads\//, '') || '브랜치 없음',
         status: node.repository.status, dirtyCount: node.repository.dirtyCount, excludedCount: node.repository.excludedCount,
+        agentHistoryEnabled: node.repository.agentHistoryEnabled, agentHistoryProblem: node.repository.agentHistoryProblem,
+        showAgentReports: this.source.showAgentReports === true,
       } : {}),
       ...(node.kind === 'snapshot' && snapshot ? {
         endedAt: snapshot.endedAt, time: compactTime(snapshot.endedAt), branch: branchLabel(snapshot.context),
@@ -78,6 +106,11 @@ export class TimelineView implements vscode.WebviewViewProvider, vscode.Disposab
         changedFiles: snapshot.changedFiles, pinned: snapshot.metadata.pinned, committed: snapshot.boundaryState === 'committed', partial: snapshot.boundaryState === 'partial',
         summary: snapshot.summary, rangeError: snapshot.rangeError, comparisonPruned: snapshot.comparisonPruned,
         commitSummary: snapshot.commitSummary, commitChangedFiles: snapshot.commitChangedFiles,
+        agentDescription: snapshot.agentDescription, agentSource: snapshot.agentSource,
+      } : {}),
+      ...(node.kind === 'agent' && node.agentReport ? {
+        collectedAt: node.agentReport.collectedAt, reportDescription: node.agentReport.description,
+        association: node.agentReport.association.status, linkedCount: node.agentReport.association.evidence.length,
       } : {}),
       ...(node.kind === 'file' && node.change ? { path: node.change.path, change: node.change.kind || 'modified', commitIncluded: node.commitIncluded, commitOnly: node.commitOnly } : {}),
     };
@@ -103,11 +136,30 @@ export class TimelineView implements vscode.WebviewViewProvider, vscode.Disposab
 
   private async receive(message: unknown): Promise<void> {
     if (!message || typeof message !== 'object') return;
-    const value = message as { type?: unknown; id?: unknown; action?: unknown };
+    const value = message as { type?: unknown; id?: unknown; action?: unknown; values?: unknown; snapshotId?: unknown };
     if (value.type === 'ready') { await this.update(); return; }
     if (typeof value.id !== 'string') return;
     const node = this.nodes.get(value.id);
     if (!node) { if (value.type === 'action' || value.type === 'expand') await this.update(); return; }
+    if (value.type === 'managementClose' && value.id === this.managedRepository && !this.managementBusy) {
+      this.managedRepository = undefined; this.managedSnapshots.clear(); return;
+    }
+    if (value.type === 'saveRecording' || value.type === 'managementAction') {
+      if (node.kind !== 'repository' || !node.repository || value.id !== this.managedRepository || this.managementBusy) return;
+      if (value.type === 'managementAction' && (typeof value.action !== 'string' || !['pause', 'resume', 'prune', 'delete'].includes(value.action)
+        || value.action === 'delete' && (typeof value.snapshotId !== 'string' || !this.managedSnapshots.has(value.snapshotId)))) return;
+      this.managementBusy = true;
+      try {
+        if (value.type === 'saveRecording') await this.source.saveRecording(node.repository, value.values);
+        else await this.source.manageAction(node.repository, value.action as 'pause' | 'resume' | 'prune' | 'delete', value.snapshotId as string | undefined);
+        await this.update();
+        const latest = this.nodes.get(value.id);
+        if (latest) await this.managementState(value.id, latest, value.type === 'saveRecording' ? '기록 주기를 저장했습니다.' : '관리 상태를 갱신했습니다.');
+      } catch (error) {
+        await this.view?.webview.postMessage({ type: 'managementError', id: value.id, message: error instanceof Error ? error.message : '관리 요청을 처리하지 못했습니다.' });
+      } finally { this.managementBusy = false; }
+      return;
+    }
     try {
       if (value.type === 'expand' && node.kind === 'snapshot') {
         const generation = this.generation;
@@ -129,5 +181,6 @@ export class TimelineView implements vscode.WebviewViewProvider, vscode.Disposab
     this.subscription.dispose(); this.viewSubscriptions.forEach(d => d.dispose());
     if (this.timer) clearTimeout(this.timer);
     this.view = undefined; this.generation++; this.nodes.clear();
+    this.managedRepository = undefined; this.managedSnapshots.clear();
   }
 }

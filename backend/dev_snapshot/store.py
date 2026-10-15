@@ -145,6 +145,8 @@ class Store:
         return object_hash
 
     def get(self, object_hash: str, expected_size: int | None = None) -> bytes:
+        if expected_size is not None and (type(expected_size) is not int or not 0 <= expected_size <= MAX_FILE):
+            raise SafetyError("Invalid expected object size.")
         source = self._object(object_hash)
         import stat
         from .common import metadata_is_link
@@ -153,7 +155,11 @@ class Store:
             raise SafetyError("Invalid stored object.")
         try:
             with gzip.open(source, "rb") as stream:
-                data = stream.read(MAX_FILE + 1)
+                # BufferedReader allocates for the requested size even for tiny objects.
+                # The extra byte still rejects oversized data and forces valid objects
+                # through EOF, including gzip's CRC/trailer verification.
+                limit = min(MAX_FILE, expected_size) if expected_size is not None else MAX_FILE
+                data = stream.read(limit + 1)
         except (OSError, EOFError) as error:
             raise SafetyError("Stored object is unreadable.") from error
         if len(data) > MAX_FILE or sha(data) != object_hash or expected_size is not None and len(data) != expected_size:

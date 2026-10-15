@@ -24,7 +24,7 @@ export function compactTime(value: string, now = new Date()): string {
 }
 
 export function workTitle(snapshot: SnapshotItem): string {
-  return snapshot.metadata.title || (snapshot.reason === 'initial' ? '기존 미커밋 작업' : snapshot.summary);
+  return snapshot.metadata.title || snapshot.summary;
 }
 
 export function repositoryStatus(repo: Repository): string {

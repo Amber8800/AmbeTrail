@@ -4,23 +4,19 @@ import * as path from 'node:path';
 import { PythonBridge } from './bridge';
 import { ReviewDocuments } from './documents';
 import { TimelineView } from './timelineView';
+import { HistoryUsage, ManagementState, recordingFields, recordingMaximum, recordingValue } from './management';
 import { branchColor, branchLabel, compactTime, repositoryStatus, snapshotContext, workTitle } from './presentation';
-import { BoundaryReview, CaptureJob, Change, Diff, GitContext, Journal, PushReview, Receipt, Repository, RestorePlan, SnapshotItem } from './protocol';
+import { AgentLinkReview, AgentReport, BoundaryReview, CaptureJob, Change, Diff, GitContext, Journal, PushReview, Receipt, Repository, RestorePlan, SnapshotItem } from './protocol';
 
 interface GitRepository { rootUri: vscode.Uri; state: { onDidChange: vscode.Event<void> } }
 interface GitApi { git: { path: string }; repositories: GitRepository[]; onDidOpenRepository: vscode.Event<GitRepository>; onDidCloseRepository: vscode.Event<GitRepository> }
 interface GitExtension { enabled: boolean; getAPI(version: 1): GitApi; onDidChangeEnablement: vscode.Event<boolean> }
 
-interface HistorySnapshot {
-  id: string; endedAt: string; reason: string; internalBaseline: boolean; protected: boolean;
-  title: string; context: GitContext;
-}
-interface HistoryUsage { bytes: number; limit: number; snapshots: HistorySnapshot[] }
-
-type Kind = 'repository' | 'snapshot' | 'file' | 'message' | 'recovery' | 'more';
+type Kind = 'repository' | 'snapshot' | 'file' | 'message' | 'recovery' | 'more' | 'agent';
 class Item extends vscode.TreeItem {
   commitIncluded?: boolean;
   commitOnly?: boolean;
+  agentReport?: AgentReport;
   constructor(readonly kind: Kind, label: string, readonly repository?: Repository, readonly snapshot?: SnapshotItem, readonly change?: Change, readonly journal?: Journal) {
     super(label, ['repository', 'snapshot'].includes(kind) ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None);
     this.contextValue = kind;
@@ -32,6 +28,12 @@ class Timeline implements vscode.TreeDataProvider<Item> {
   readonly onDidChangeTreeData = this.emitter.event;
   readonly limits = new Map<string, number>();
   constructor(readonly app: Application) {}
+  get showAgentReports(): boolean { return vscode.workspace.getConfiguration('devSnapshot').get<boolean>('showAgentReports', false); }
+  management(repo: Repository): Promise<ManagementState> { return this.app.management(repo); }
+  saveRecording(repo: Repository, values: unknown): Promise<void> { return this.app.saveRecording(repo, values); }
+  manageAction(repo: Repository, action: 'pause' | 'resume' | 'prune' | 'delete', snapshotId?: string): Promise<void> {
+    return this.app.manageAction(repo, action, snapshotId);
+  }
   refresh(): void { this.emitter.fire(undefined); }
   getTreeItem(item: Item): vscode.TreeItem { return item; }
   async getChildren(item?: Item): Promise<Item[]> {
@@ -65,9 +67,25 @@ class Timeline implements vscode.TreeDataProvider<Item> {
         node.tooltip = `${workTitle(snapshot)}\n${new Date(snapshot.endedAt).toLocaleString()}\n${snapshotContext(snapshot.context)}\n이번 기록: 파일 ${snapshot.changedFiles}개 변경 · 미검증${snapshot.metadata.pinned ? ' · 고정' : ''}${snapshot.metadata.commitIds.length ? ' · 커밋 연결' : ''}\n자동 요약: ${snapshot.summary}\n${snapshot.reason === 'initial' ? '확장 시작 전에 존재하던 미커밋 작업' : snapshot.reason}\n커밋 버튼: 직전 커밋 경계부터 이 시점까지 / 복원 버튼: 이 스냅샷 복원 / 휴지통: 기록 삭제\n우클릭 → 작업 이름 편집\n복원 시 객체 무결성을 검사합니다. 정상 동작을 검증한 상태는 아닙니다.\n${snapshot.comparisonPruned ? '이전 비교 기록이 삭제되어 포함 파일 기준으로 표시합니다.' : ''}`;
         if (snapshot.commitSummary && snapshot.commitChangedFiles != null) node.tooltip += `\n커밋 대상 구간: ${snapshot.commitSummary} · 파일 ${snapshot.commitChangedFiles}개`;
         if (snapshot.rangeError) node.tooltip += `\n커밋 구간 계산 불가: ${snapshot.rangeError}\n이번 기록의 요약은 그대로 표시합니다.`;
+        if (snapshot.agentSource) node.tooltip += `\n${snapshot.agentSource}\n${snapshot.agentDescription || ''}\n파일 작성자나 테스트 성공을 AmberTrail이 검증한 것은 아닙니다.`;
         node.accessibilityInformation = { label: `${workTitle(snapshot)} · ${snapshotContext(snapshot.context)}` };
         node.iconPath = new vscode.ThemeIcon(snapshot.metadata.pinned ? 'pinned' : snapshot.boundaryState === 'committed' ? 'check' : 'circle-small-filled', new vscode.ThemeColor(branchColor(snapshot.context.branch)));
         result.push(node);
+      }
+      if (this.showAgentReports && repo.agentHistoryPresent) {
+        try {
+          const reports = await this.app.call<AgentReport[]>('agentHistory', repo, { limit });
+          for (const report of reports) {
+            const node = new Item('agent', report.title, repo);
+            node.id = `${repo.id}/agent/${report.id}`; node.agentReport = report;
+            node.description = `Codex 최종 답변 · ${report.association.status === 'confirmed' ? '사용자 확인 연결' : report.association.status === 'uncertain' ? '불확실한 연결' : '미연결'}`;
+            node.tooltip = `${report.title}\n${report.description}\n수집 시각: ${new Date(report.collectedAt).toLocaleString()}\n원본 발생 시각은 Hook이 제공하지 않습니다.\n세션: ${report.sessionId}\nTurn: ${report.turnId}\n에이전트 보고이며 코드 작성자·테스트 성공의 증거가 아닙니다.`;
+            result.push(node);
+          }
+          const records = result.filter(n => n.kind === 'snapshot' || n.kind === 'agent').sort((a, b) =>
+            (b.agentReport?.collectedAt || b.snapshot!.endedAt).localeCompare(a.agentReport?.collectedAt || a.snapshot!.endedAt));
+          result.splice(0, result.length, ...result.filter(n => n.kind === 'recovery'), ...records);
+        } catch { /* Optional metadata must not hide file history. */ }
       }
       if (snapshots.length === limit && limit < 1000) {
         const more = new Item('more', '더 보기', repo);
@@ -130,6 +148,7 @@ class Application {
   private gitApi?: GitApi;
   private stopped = false;
   private errorShown = new Set<string>();
+  private view?: TimelineView;
   commitExclusions(repo: Repository, snapshot: SnapshotItem): Set<string> {
     return new Set(this.context.workspaceState.get<Record<string, string[]>>('commitExclusions', {})[`${repo.id}/${snapshot.id}`] ?? []);
   }
@@ -139,9 +158,10 @@ class Application {
     if (excluded.size) saved[key] = [...excluded]; else delete saved[key];
     await this.context.workspaceState.update('commitExclusions', saved);
   }
-  constructor(readonly context: vscode.ExtensionContext, readonly bridge: PythonBridge) {}
+  constructor(readonly context: vscode.ExtensionContext, readonly bridge: PythonBridge, private readonly python: string) {}
   async start(): Promise<void> {
     const view = new TimelineView(this.timeline, this.context.extensionUri);
+    this.view = view;
     this.context.subscriptions.push(view, vscode.window.registerWebviewViewProvider('devSnapshot.timeline', view), vscode.workspace.registerTextDocumentContentProvider('dev-snapshot', this.documents));
     this.commands();
     this.bridge.on('changed', () => this.scheduleRefresh());
@@ -389,14 +409,48 @@ class Application {
     await this.refresh();
   }
   private async manage(repo: Repository): Promise<void> {
-    const usage = await this.call<HistoryUsage>('usage', repo);
-    const action = await vscode.window.showQuickPick(['보존 정책으로 정리', '스냅샷 삭제', repo.paused ? '자동 기록 재개' : '자동 기록 일시 중지'], { title: `기록 관리 · ${(usage.bytes / 1048576).toFixed(1)} / ${(usage.limit / 1048576).toFixed(0)} MiB` });
-    if (!action) return;
-    if (action === '보존 정책으로 정리') await this.call('prune', repo);
-    else if (action === '스냅샷 삭제') {
-      const picked = await vscode.window.showQuickPick(usage.snapshots.filter(s => !s.protected).map(s => ({ label: s.title, description: compactTime(s.endedAt), detail: `${snapshotContext(s.context).replace('\n', ' · ')}${s.internalBaseline ? ' · 이전 내부 비교 기준' : s.reason === 'backup' ? ' · 보호 기간이 끝난 백업' : ''}`, id: s.id })), { title: '삭제할 비보호 기록 선택 · 제외 정책 변경은 과거 기록을 지우지 않습니다' });
-      if (picked) await this.deleteSnapshot(repo, picked);
-    } else await this.call(repo.paused ? 'resume' : 'pause', repo);
+    await this.view?.openManagement(repo.id);
+  }
+  async management(repo: Repository): Promise<ManagementState> {
+    const config = vscode.workspace.getConfiguration('devSnapshot', vscode.Uri.file(repo.root));
+    return { name: path.basename(repo.root), writable: repo.writable, paused: repo.paused,
+      usage: await this.call<HistoryUsage>('usage', repo),
+      recording: recordingFields.map(field => ({ ...field,
+        value: config.get<number>(field.key, field.fallback) / field.scale, maximum: recordingMaximum(field) })),
+    };
+  }
+  async saveRecording(repo: Repository, values: unknown): Promise<void> {
+    if (!repo.writable) throw new Error('읽기 전용 저장소에서는 기록 주기를 변경할 수 없습니다.');
+    if (!values || typeof values !== 'object' || Array.isArray(values)
+      || Object.keys(values).length !== recordingFields.length
+      || !recordingFields.every(field => Object.prototype.hasOwnProperty.call(values, field.key))) throw new Error('기록 주기 설정 형식이 올바르지 않습니다.');
+    const resource = vscode.Uri.file(repo.root);
+    const config = vscode.workspace.getConfiguration('devSnapshot', resource);
+    const target = vscode.workspace.getWorkspaceFolder(resource) ? vscode.ConfigurationTarget.WorkspaceFolder
+      : vscode.workspace.workspaceFolders?.length ? vscode.ConfigurationTarget.Workspace : vscode.ConfigurationTarget.Global;
+    const updates = recordingFields.map(field => {
+      const current = config.get<number>(field.key, field.fallback);
+      const next = recordingValue(field, (values as Record<string, unknown>)[field.key], current);
+      const previous = config.inspect<number>(field.key);
+      const saved = target === vscode.ConfigurationTarget.WorkspaceFolder ? previous?.workspaceFolderValue
+        : target === vscode.ConfigurationTarget.Workspace ? previous?.workspaceValue : previous?.globalValue;
+      return { key: field.key, next, current, saved };
+    }).filter(update => update.next !== update.current);
+    const applied: typeof updates = [];
+    try {
+      for (const update of updates) { await config.update(update.key, update.next, target); applied.push(update); }
+    } catch (error) {
+      for (const update of applied.reverse()) {
+        // Preserve any external settings edit that happened during the save.
+        if (config.get(update.key) === update.next) await config.update(update.key, update.saved, target);
+      }
+      throw error;
+    }
+  }
+  async manageAction(repo: Repository, action: 'pause' | 'resume' | 'prune' | 'delete', snapshotId?: string): Promise<void> {
+    if (!repo.writable) throw new Error('읽기 전용 저장소에서는 기록을 관리할 수 없습니다.');
+    if (action === 'delete' && snapshotId) await this.deleteSnapshot(repo, { id: snapshotId });
+    else if (action !== 'delete') await this.call(action, repo);
     await this.refresh();
   }
   private async capture(repo: Repository): Promise<void> {
@@ -422,6 +476,48 @@ class Application {
       }));
     };
     register('captureNow', repo => this.capture(repo));
+    register('agentHistorySettings', async repo => {
+      if (!repo.writable) return;
+      const choices = repo.agentHistoryEnabled
+        ? ['Hook 설정 예시 보기', '수집 비활성화', '에이전트 기록 삭제']
+        : ['이 저장소의 최종 답변 수집 허용', ...(repo.agentHistoryPresent ? ['에이전트 기록 삭제'] : [])];
+      const choice = await vscode.window.showQuickPick(choices, { title: 'Codex 최종 답변 연동 · 현재 Hook 실행 환경은 별도 확인 필요' });
+      if (!choice) return;
+      if (choice === '수집 비활성화') { await this.call('agentConsent', repo, { enabled: false, approved: true }); return; }
+      if (choice === '에이전트 기록 삭제') {
+        const approved = await vscode.window.showWarningMessage(`이 저장소의 Codex 작업 설명과 연결만 삭제하고 수집을 비활성화합니다. 스냅샷은 유지됩니다.\n${repo.root}`, { modal: true }, '에이전트 기록 삭제');
+        if (approved) await this.call('agentClear', repo, { approved: true });
+        return;
+      }
+      if (choice === '이 저장소의 최종 답변 수집 허용') {
+        const approved = await vscode.window.showWarningMessage(`이 저장소에서 Codex가 이미 보낸 최종 답변의 일부를 로컬에 보관합니다. 최대 제목 100자·설명 700자, 30일·500개·2MiB 한도입니다. 민감정보 탐지는 완벽하지 않습니다.\n${repo.root}\n추가 모델 호출은 없습니다. Codex 설정은 자동으로 변경하지 않습니다.`, { modal: true }, '이 저장소 수집 허용');
+        if (!approved) return;
+        await this.call('agentConsent', repo, { enabled: true, approved: true });
+      }
+      const setup = await this.call<object>('agentSetup', repo, { python: this.python, script: path.join(this.context.extensionPath, 'backend/codex_hook.py') });
+      await this.documents.text('Codex Hook 설정 예시 · 검토 후 수동 병합', `이 예시는 설정을 설치하지 않습니다. 지원되는 Codex에서 저장소의 .codex/hooks.json에 기존 hooks를 보존하며 Stop handler를 한 번만 병합하고 /hooks에서 검토·신뢰하세요.\n기존 전역/프로젝트 Hook을 덮어쓰지 마세요. transcript나 Prompt는 읽지 않습니다.\n비활성화·재활성화 시 이전 명령의 grant는 폐기됩니다. 해제 시 이 명령의 handler만 수동 제거하세요.\n이 실행 환경에서 실제 최종 답변 전달은 아직 검증되지 않았습니다. 중간 메시지는 지원하지 않습니다.\n\n${JSON.stringify(setup, null, 2)}`);
+    });
+    register('agentReportDetails', async (_repo, item) => {
+      if (item?.agentReport) await this.documents.text('Codex 최종 답변 · 에이전트 보고', item.tooltip?.toString() || item.agentReport.title);
+    });
+    register('linkAgentReport', async (repo, item) => {
+      if (!repo.writable || !item?.agentReport) return;
+      const snapshots = await this.call<SnapshotItem[]>('timeline', repo, { limit: 1000 });
+      const selected = await vscode.window.showQuickPick(snapshots.filter(s => s.changedFiles > 0).map(s => ({ label: workTitle(s), description: compactTime(s.endedAt), detail: snapshotContext(s.context), snapshot: s })), { canPickMany: true, title: '내용을 직접 검토할 스냅샷 선택 · 시각만으로 작업 귀속을 확정하지 않습니다' });
+      if (!selected?.length) return;
+      const snapshotIds = selected.map(s => s.snapshot.id);
+      const review = await this.call<AgentLinkReview>('agentLinkReview', repo, { messageId: item.agentReport.id, snapshotIds });
+      await this.documents.text('에이전트 설명과 코드 변경 연결 검토', `Codex 보고: ${review.title}\n\n${review.evidence.map(e => `${e.snapshotId}\n${snapshotContext(e.context)}\n트리: ${e.treeHash}\n변경 파일 ${e.changedFiles}개 (최대 100개 표시)\n${e.changedPaths.join('\n')}`).join('\n\n')}\n\n필요하면 기존 타임라인의 변경 비교에서 Diff를 확인하세요. 이 연결은 작성자나 테스트 성공의 판정이 아닙니다.`);
+      const approved = await vscode.window.showWarningMessage('표시된 코드 변경을 이 에이전트 설명과 연결하시겠습니까? 코드 상태와 Git 커밋 범위는 변경되지 않습니다.', { modal: true }, '검토한 기록에 연결');
+      if (approved) await this.call('agentLink', repo, { messageId: item.agentReport.id, snapshotIds, reviewHash: review.reviewHash, approved: true });
+    });
+    register('openAgentSnapshots', async (repo, item) => {
+      if (!item?.agentReport) return;
+      const ids = new Set(item.agentReport.association.evidence.map(e => e.snapshotId));
+      const snapshots = (await this.call<SnapshotItem[]>('timeline', repo, { limit: 1000 })).filter(s => ids.has(s.id));
+      const selected = await vscode.window.showQuickPick(snapshots.map(s => ({ label: workTitle(s), description: compactTime(s.endedAt), snapshot: s })), { title: '연결된 기록의 Diff 확인 · 삭제된 기록은 표시되지 않습니다' });
+      if (selected) await vscode.commands.executeCommand('devSnapshot.openDiff', new Item('snapshot', workTitle(selected.snapshot), repo, selected.snapshot));
+    });
     register('pauseRecording', repo => this.call('pause', repo));
     register('resumeRecording', repo => this.call('resume', repo));
     register('restoreSnapshot', (repo, item) => this.restore(repo, false, item));
@@ -448,6 +544,7 @@ class Application {
     register('pinSnapshot', async (repo, item) => { const snapshot = await this.snapshot(repo, item); if (snapshot) await this.call('pin', repo, { snapshotId: snapshot.id }); });
     register('deleteSnapshot', async (repo, item) => { const snapshot = await this.snapshot(repo, item); if (snapshot) await this.deleteSnapshot(repo, snapshot); });
     register('manageHistory', repo => this.manage(repo));
+    register('recordingSettings', repo => this.manage(repo));
     register('recover', (repo, item) => this.recover(repo, item));
     register('more', async repo => { this.timeline.limits.set(repo.id, (this.timeline.limits.get(repo.id) ?? 50) + 50); this.timeline.refresh(); });
     register('openDiff', async (repo, item) => {
@@ -477,7 +574,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<{ read
     if (fs.existsSync(developmentPython)) python = developmentPython;
   }
   const bridge = new PythonBridge(python, path.join(context.extensionPath, 'backend/run.py'), context.extensionPath);
-  application = new Application(context, bridge);
+  application = new Application(context, bridge, python);
   try { await application.start(); return { ready: true }; }
   catch (e) { void vscode.window.showErrorMessage(e instanceof Error ? e.message : 'AmberTrail 시작 실패'); return { ready: false }; }
 }
