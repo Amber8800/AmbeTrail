@@ -11,7 +11,7 @@ export async function run(): Promise<void> {
 }
 
 async function scenario(): Promise<void> {
-  const extension = vscode.extensions.getExtension<{ ready: boolean }>('dev-snapshot.dev-snapshot');
+  const extension = vscode.extensions.getExtension<{ ready: boolean }>('amber8800.dev-snapshot');
   assert.ok(extension, 'Extension must be registered');
   const api = await extension.activate(); assert.equal(api.ready, true, 'Python bridge and UI must activate');
   const commands = await vscode.commands.getCommands(true);

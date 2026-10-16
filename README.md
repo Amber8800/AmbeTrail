@@ -298,4 +298,6 @@ CI는 Windows·macOS·Linux와 VS Code 1.95/최신 안정 버전을 대상으로
 - [선택적 Codex 연동 기록](docs/codex-history.md)
 - [MIT 라이선스](LICENSE)
 
-기존 설치의 기록과 설정을 이어 쓰기 위해 내부 확장 ID `dev-snapshot.dev-snapshot`과 명령·설정 접두사 `devSnapshot.*`를 유지합니다.
+Marketplace 게시자 ID는 `amber8800`, 확장 ID는 `amber8800.dev-snapshot`입니다. 화면에는 **AmberTrail**로 표시하며, 명령·설정 접두사는 `devSnapshot.*`를 사용합니다.
+
+이전 시험 설치의 확장 ID `dev-snapshot.dev-snapshot`과는 별도 확장으로 인식됩니다. 확장 전용 저장 공간도 달라 기존 기록을 자동으로 이전하지 않습니다. 기존 기록이 필요하면 이전 설치의 저장 데이터를 보존하세요.

@@ -3,7 +3,7 @@
   "displayName": "AmberTrail",
   "description": "Private local development snapshots with reviewed restore and Git commits.",
   "version": "0.2.5",
-  "publisher": "dev-snapshot",
+  "publisher": "amber8800",
   "license": "MIT",
   "engines": { "vscode": "^1.95.0" },
   "categories": ["SCM Providers", "Other"],
